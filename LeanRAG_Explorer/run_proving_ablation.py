@@ -1,0 +1,325 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+from pantograph import Server
+
+from lean_dojo_v2.agent.lean_agent import LeanAgent
+from lean_dojo_v2.lean_dojo.data_extraction.lean import LeanGitRepo, Pos
+from lean_dojo_v2.lean_dojo.data_extraction.trace import get_traced_repo_path
+from lean_dojo_v2.prover.retrieval_prover import RetrievalProver
+from lean_dojo_v2.utils.constants import RAID_DIR
+from lean_dojo_v2.utils.filesystem import find_latest_checkpoint
+
+
+def _split_state(state: str) -> Tuple[List[str], str]:
+    if "⊢" in state:
+        lhs, rhs = state.split("⊢", 1)
+        hyps = [x.strip() for x in lhs.splitlines() if x.strip()]
+        goal = rhs.strip()
+        return hyps, goal
+    return [], state.strip()
+
+
+_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_'.]*")
+
+
+def _tokens(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN.findall(text)]
+
+
+def _goal_keyword_filter(goal: str, hypotheses: List[str], top_n: int = 6) -> List[str]:
+    goal_kw = {t for t in _tokens(goal) if len(t) > 2}
+    scored: List[Tuple[int, str]] = []
+    for h in hypotheses:
+        score = sum(1 for t in _tokens(h) if t in goal_kw)
+        if score > 0:
+            scored.append((score, h))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [h for _, h in scored[:top_n]]
+
+
+def build_query_variant(
+    variant: str,
+    state: str,
+    theorem_statement: str,
+    recent_tactics: List[str],
+) -> str:
+    """Build transformed retrieval query from original proof state.
+
+    Important:
+      - We ONLY transform the query sent to retriever.
+      - We do NOT change the proving engine, search budget, or theorem set.
+    """
+
+    hyps, goal = _split_state(state)
+
+    if variant == "raw_state":
+        return state
+
+    if variant == "goal_only":
+        return goal if goal else state
+
+    if variant == "macro_context":
+        ts = theorem_statement.strip()
+        return f"{ts}\n\n{state}" if ts else state
+
+    if variant == "temporal_context":
+        tail = recent_tactics[-8:]
+        if not tail:
+            return state
+        history = "\n".join(f"- {t}" for t in tail)
+        return f"Recent tactics:\n{history}\n\nCurrent state:\n{state}"
+
+    if variant == "denoised_state":
+        selected = _goal_keyword_filter(goal, hyps, top_n=6)
+        if selected:
+            return f"Goal:\n{goal}\n\nRelevant hypotheses:\n" + "\n".join(selected)
+        return f"Goal:\n{goal}" if goal else state
+
+    raise ValueError(f"Unknown variant: {variant}")
+
+
+@dataclass
+class QueryTransformingRetriever:
+    """Adapter around LeanDojo retriever that transforms query states only."""
+
+    base_retriever: object
+    variant: str
+    get_context: Callable[[str], Dict[str, object]]
+
+    def retrieve(
+        self,
+        state: List[str],
+        file_name: List[str],
+        theorem_full_name: List[str],
+        theorem_pos: List[Pos],
+        k: int,
+    ):
+        transformed: List[str] = []
+        for s, thm_name in zip(state, theorem_full_name):
+            ctx = self.get_context(thm_name)
+            theorem_statement = str(ctx.get("theorem_statement", ""))
+            recent_tactics = list(ctx.get("recent_tactics", []))
+            transformed.append(
+                build_query_variant(
+                    self.variant, s, theorem_statement=theorem_statement, recent_tactics=recent_tactics
+                )
+            )
+        return self.base_retriever.retrieve(
+            transformed,
+            file_name,
+            theorem_full_name,
+            theorem_pos,
+            k,
+        )
+
+
+class AblationRetrievalProver(RetrievalProver):
+    """RetrievalProver subclass with query-stage-only ablation hooks."""
+
+    def __init__(
+        self,
+        ret_ckpt_path: str,
+        gen_ckpt_path: str,
+        indexed_corpus_path: str,
+        variant: str,
+    ):
+        super().__init__(ret_ckpt_path, gen_ckpt_path, indexed_corpus_path)
+        self.variant = variant
+        self._history_by_theorem: Dict[str, List[str]] = {}
+        self._ctx_by_theorem: Dict[str, Dict[str, object]] = {}
+
+        original = self.tactic_generator.retriever
+        assert original is not None, "Retriever must be loaded for retrieval ablation."
+        self.tactic_generator.retriever = QueryTransformingRetriever(
+            base_retriever=original,
+            variant=variant,
+            get_context=lambda n: self._ctx_by_theorem.get(n, {}),
+        )
+
+    def next_tactic(self, state, goal_id):
+        if not hasattr(self, "theorem") or self.theorem is None:
+            return None
+
+        theorem_name = self.theorem.full_name
+        if theorem_name not in self._history_by_theorem:
+            self._history_by_theorem[theorem_name] = []
+        self._ctx_by_theorem[theorem_name] = {
+            "theorem_statement": getattr(self.theorem, "theorem_statement", "") or "",
+            "recent_tactics": self._history_by_theorem[theorem_name],
+        }
+
+        suggestions = self.tactic_generator.generate(
+            state=str(state),
+            file_path=str(self.theorem.file_path),
+            theorem_full_name=self.theorem.full_name,
+            theorem_pos=self.theorem.start,
+            num_samples=10,
+        )
+        if not suggestions:
+            return None
+        tactics, log_probs = zip(*suggestions)
+        probs = np.exp(log_probs) / np.sum(np.exp(log_probs))
+        selected = random.choices(tactics, weights=probs, k=1)[0]
+        self._history_by_theorem[theorem_name].append(str(selected))
+        return selected
+
+
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def run_variant(
+    variant: str,
+    theorem_repo_pairs,
+    ret_ckpt_path: str,
+    gen_ckpt_path: str,
+    corpus_jsonl_path: str,
+    max_theorems: int,
+) -> List[Dict[str, object]]:
+    prover = AblationRetrievalProver(
+        ret_ckpt_path=ret_ckpt_path,
+        gen_ckpt_path=gen_ckpt_path,
+        indexed_corpus_path=corpus_jsonl_path,
+        variant=variant,
+    )
+
+    rows: List[Dict[str, object]] = []
+    for idx, (theorem, repo) in enumerate(theorem_repo_pairs[:max_theorems]):
+        traced_repo_path = get_traced_repo_path(repo, build_deps=True)
+        server = Server(
+            imports=["Init", str(theorem.file_path).replace(".lean", "")],
+            project_path=traced_repo_path,
+        )
+        result, used_tactics = prover.search(server=server, theorem=theorem, verbose=False)
+        rows.append(
+            {
+                "variant": variant,
+                "index": idx,
+                "theorem_full_name": theorem.full_name,
+                "file_path": str(theorem.file_path),
+                "success": bool(result.success),
+                "steps": int(result.steps),
+                "duration": _safe_float(result.duration),
+                "num_used_tactics": len(used_tactics) if used_tactics is not None else 0,
+            }
+        )
+    return rows
+
+
+def summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    if not rows:
+        return {
+            "num_theorems": 0,
+            "success_rate": 0.0,
+            "avg_steps": 0.0,
+            "avg_duration_sec": 0.0,
+        }
+    success_vals = [1.0 if r["success"] else 0.0 for r in rows]
+    return {
+        "num_theorems": len(rows),
+        "success_rate": mean(success_vals),
+        "avg_steps": mean(float(r["steps"]) for r in rows),
+        "avg_duration_sec": mean(float(r["duration"]) for r in rows),
+    }
+
+
+def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("")
+        return
+    keys = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="End-to-end proving ablation by query-stage retrieval variants."
+    )
+    parser.add_argument("--url", required=True, help="GitHub repository URL.")
+    parser.add_argument("--commit", required=True, help="Commit hash.")
+    parser.add_argument("--database-path", default="dynamic_database.json")
+    parser.add_argument("--output-dir", default="outputs/proving_ablation")
+    parser.add_argument("--max-theorems", type=int, default=50)
+    parser.add_argument(
+        "--variants",
+        default="raw_state,goal_only,macro_context,temporal_context,denoised_state",
+        help="Comma-separated query variants.",
+    )
+    parser.add_argument("--ret-ckpt-path", default="")
+    parser.add_argument("--gen-ckpt-path", default=f"{RAID_DIR}/model_lightning.ckpt")
+    parser.add_argument("--corpus-jsonl-path", default="")
+    parser.add_argument("--seed", type=int, default=3407)
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    agent = LeanAgent(database_path=args.database_path)
+    agent.setup_github_repository(url=args.url, commit=args.commit)
+
+    # Same theorem pool for all variants.
+    theorem_repo_pairs = []
+    for repo in agent.repos:
+        repository = agent.database.get_repository(repo.url, repo.commit)
+        for theorem in repository.sorry_theorems_unproved:
+            theorem_repo_pairs.append((theorem, repo))
+    if not theorem_repo_pairs:
+        raise RuntimeError("No sorry theorems found in repository.")
+
+    ret_ckpt_path = args.ret_ckpt_path or find_latest_checkpoint()
+    if not ret_ckpt_path:
+        raise RuntimeError("Cannot find retriever checkpoint. Pass --ret-ckpt-path.")
+
+    corpus_jsonl_path = args.corpus_jsonl_path or str(agent.data_path / "corpus.jsonl")
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+
+    all_rows: List[Dict[str, object]] = []
+    summary: Dict[str, object] = {
+        "url": args.url,
+        "commit": args.commit,
+        "max_theorems": args.max_theorems,
+        "variants": variants,
+        "results": {},
+    }
+
+    for variant in variants:
+        rows = run_variant(
+            variant=variant,
+            theorem_repo_pairs=theorem_repo_pairs,
+            ret_ckpt_path=ret_ckpt_path,
+            gen_ckpt_path=args.gen_ckpt_path,
+            corpus_jsonl_path=corpus_jsonl_path,
+            max_theorems=args.max_theorems,
+        )
+        all_rows.extend(rows)
+        summary["results"][variant] = summarize_rows(rows)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(out_dir / "proving_results.csv", all_rows)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+
