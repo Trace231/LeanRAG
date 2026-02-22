@@ -799,7 +799,7 @@ class TracedFile:
                 comments.append(c)
         return comments
 
-    def get_direct_dependencies(self, repo: LeanGitRepo) -> List[Tuple[str, Path]]:
+    def get_direct_dependencies(self, repo: LeanGitRepo) -> List[Tuple[str, Path]]: #@@
         """Return the names and paths of all modules imported by the current :file:`*.lean` file."""
         deps = set()
 
@@ -928,7 +928,7 @@ def _save_xml_to_disk(tf: TracedFile) -> None:
         oup.write(tf.to_xml())
 
 
-def _build_dependency_graph(
+def _build_dependency_graph( 
     seed_files: List[TracedFile], root_dir: Path, repo: LeanGitRepo
 ) -> nx.DiGraph:
     G = nx.DiGraph()
