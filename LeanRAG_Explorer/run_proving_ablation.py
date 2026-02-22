@@ -5,7 +5,6 @@ import csv
 import json
 import random
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Callable, Dict, List, Optional, Tuple
@@ -89,41 +88,6 @@ def build_query_variant(
     raise ValueError(f"Unknown variant: {variant}")
 
 
-@dataclass
-class QueryTransformingRetriever:
-    """Adapter around LeanDojo retriever that transforms query states only."""
-
-    base_retriever: object
-    variant: str
-    get_context: Callable[[str], Dict[str, object]]
-
-    def retrieve(
-        self,
-        state: List[str],
-        file_name: List[str],
-        theorem_full_name: List[str],
-        theorem_pos: List[Pos],
-        k: int,
-    ):
-        transformed: List[str] = []
-        for s, thm_name in zip(state, theorem_full_name):
-            ctx = self.get_context(thm_name)
-            theorem_statement = str(ctx.get("theorem_statement", ""))
-            recent_tactics = list(ctx.get("recent_tactics", []))
-            transformed.append(
-                build_query_variant(
-                    self.variant, s, theorem_statement=theorem_statement, recent_tactics=recent_tactics
-                )
-            )
-        return self.base_retriever.retrieve(
-            transformed,
-            file_name,
-            theorem_full_name,
-            theorem_pos,
-            k,
-        )
-
-
 class AblationRetrievalProver(RetrievalProver):
     """RetrievalProver subclass with query-stage-only ablation hooks."""
 
@@ -141,11 +105,50 @@ class AblationRetrievalProver(RetrievalProver):
 
         original = self.tactic_generator.retriever
         assert original is not None, "Retriever must be loaded for retrieval ablation."
-        self.tactic_generator.retriever = QueryTransformingRetriever(
-            base_retriever=original,
-            variant=variant,
-            get_context=lambda n: self._ctx_by_theorem.get(n, {}),
-        )
+        self._install_query_transform_patch(original)
+
+    def _install_query_transform_patch(self, retriever_module: object) -> None:
+        """Patch retriever.retrieve without replacing the nn.Module instance.
+
+        Why:
+          `tactic_generator` is a torch.nn.Module and its child attribute
+          `retriever` must remain an nn.Module (or None). Replacing it with
+          a plain Python object raises:
+            TypeError: ... child module 'retriever' (torch.nn.Module or None expected)
+        """
+
+        original_retrieve = retriever_module.retrieve
+
+        def patched_retrieve(
+            state: List[str],
+            file_name: List[str],
+            theorem_full_name: List[str],
+            theorem_pos: List[Pos],
+            k: int,
+        ):
+            transformed: List[str] = []
+            for s, thm_name in zip(state, theorem_full_name):
+                ctx = self._ctx_by_theorem.get(thm_name, {})
+                theorem_statement = str(ctx.get("theorem_statement", ""))
+                recent_tactics = list(ctx.get("recent_tactics", []))
+                transformed.append(
+                    build_query_variant(
+                        self.variant,
+                        s,
+                        theorem_statement=theorem_statement,
+                        recent_tactics=recent_tactics,
+                    )
+                )
+            return original_retrieve(
+                transformed,
+                file_name,
+                theorem_full_name,
+                theorem_pos,
+                k,
+            )
+
+        # Keep module type unchanged; only swap behavior of retrieve().
+        retriever_module.retrieve = patched_retrieve
 
     def next_tactic(self, state, goal_id):
         if not hasattr(self, "theorem") or self.theorem is None:
