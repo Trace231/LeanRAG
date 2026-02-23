@@ -49,10 +49,16 @@ class Cache:
 
         with self.lock:
             if dirpath.exists():
-                assert cache_path.exists()
-                return cache_path
+                if cache_path.exists():
+                    return cache_path
+                logger.warning(
+                    "Cache directory {} exists but target cache path {} is missing. "
+                    "Treating as cache miss.",
+                    dirpath,
+                    cache_path,
+                )
 
-            elif not DISABLE_REMOTE_CACHE:
+            if not DISABLE_REMOTE_CACHE:
                 url = os.path.join(REMOTE_CACHE_URL, f"{dirname}.tar.gz")
                 if not url_exists(url):
                     return None
@@ -65,7 +71,14 @@ class Cache:
                     with tarfile.open(f"{dirpath}.tar.gz") as tar:
                         tar.extractall(self.cache_dir)
                     os.remove(f"{dirpath}.tar.gz")
-                    assert (cache_path).exists()
+                    if not cache_path.exists():
+                        logger.warning(
+                            "Downloaded cache archive {} does not contain expected path {}. "
+                            "Treating as cache miss.",
+                            f"{dirname}.tar.gz",
+                            cache_path,
+                        )
+                        return None
 
                 return cache_path
 
@@ -81,7 +94,7 @@ class Cache:
         """
         dirpath = self.cache_dir / rel_cache_dir.parent
         cache_path = self.cache_dir / rel_cache_dir
-        if not dirpath.exists():
+        if not cache_path.exists():
             with self.lock:
                 with report_critical_failure(_CACHE_CORRPUTION_MSG):
                     shutil.copytree(src, cache_path)
