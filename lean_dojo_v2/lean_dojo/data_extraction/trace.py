@@ -310,12 +310,30 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
                     "Proceeding with failed-file recovery.",
                     res.returncode,
                 )
+                stderr_tail = "\n".join((error or "").splitlines()[-40:])
+                stdout_tail = "\n".join((output or "").splitlines()[-20:])
+                if stderr_tail.strip():
+                    logger.warning("ExtractData stderr tail:\n{}", stderr_tail)
+                elif stdout_tail.strip():
+                    logger.warning(
+                        "ExtractData produced no stderr. stdout tail:\n{}",
+                        stdout_tail,
+                    )
         failed_paths = _extract_failed_paths(output, error)
         still_failed = _repair_failed_files_sequentially(failed_paths, repo_toolchain)
         if still_failed:
             logger.warning(
                 "Ignoring {} files that still failed after sequential repair.",
                 len(still_failed),
+            )
+
+        ast_count = len(list(build_path.glob("**/*.ast.json")))
+        if build_deps:
+            ast_count += len(list(packages_path.glob("**/*.ast.json")))
+        if ast_count == 0:
+            raise RuntimeError(
+                "ExtractData produced 0 *.ast.json files. "
+                "Tracing output is unusable; check the logged ExtractData stderr tail."
             )
 
         check_files(packages_path, not build_deps)

@@ -487,26 +487,21 @@ def shouldProcess (path : FilePath) (noDeps : Bool) : IO Bool := do
 /--
 Trace all *.lean files in the current directory whose corresponding *.olean file exists.
 -/
-def processAllFiles (noDeps : Bool) : IO Unit := do
+unsafe def processAllFiles (noDeps : Bool) : IO Unit := do
   let cwd ← IO.currentDir
   assert! cwd.fileName != "lean4"
   println! "Extracting data at {cwd}"
-
-  -- First pass: high-throughput parallel extraction.
-  -- A second-pass sequential repair is orchestrated in Python (trace.py).
-  let mut tasks := #[]
+  -- IMPORTANT:
+  -- The previous unbounded task fan-out (`IO.asTask` + nested `lake env lean --run`)
+  -- is unstable on large repos (e.g., mathlib), often causing early process failure
+  -- and zero AST outputs. We use in-process sequential extraction for robustness.
   for path in ← System.FilePath.walkDir cwd do
     if ← shouldProcess path noDeps then
-      let t ← IO.asTask <| IO.Process.run
-          {cmd := "lake", args := #["env", "lean", "--run", "ExtractData.lean", path.toString]}
-      tasks := tasks.push (t, path)
-
-  for (t, path) in tasks do
-    match ← IO.wait t with
-    | Except.error e =>
+      try
+        processFile path
+      catch e =>
         println! s!"WARNING: Failed to process {path}"
         println! s!"ERROR: {e.toString}"
-    | Except.ok _ => pure ()
 
 
 unsafe def main (args : List String) : IO Unit := do
