@@ -192,6 +192,7 @@ def run_variant(
     gen_ckpt_path: str,
     corpus_jsonl_path: str,
     max_theorems: int,
+    build_deps: bool,
 ) -> List[Dict[str, object]]:
     prover = AblationRetrievalProver(
         ret_ckpt_path=ret_ckpt_path,
@@ -202,7 +203,7 @@ def run_variant(
 
     rows: List[Dict[str, object]] = []
     for idx, (theorem, repo) in enumerate(theorem_repo_pairs[:max_theorems]):
-        traced_repo_path = get_traced_repo_path(repo, build_deps=True)
+        traced_repo_path = get_traced_repo_path(repo, build_deps=build_deps)
         server = Server(
             imports=["Init", str(theorem.file_path).replace(".lean", "")],
             project_path=traced_repo_path,
@@ -271,13 +272,24 @@ def main() -> None:
     parser.add_argument("--gen-ckpt-path", default=f"{RAID_DIR}/model_lightning.ckpt")
     parser.add_argument("--corpus-jsonl-path", default="")
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument(
+        "--build-deps",
+        action="store_true",
+        help="Enable full dependency tracing. Default is False (noDeps).",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     agent = LeanAgent(database_path=args.database_path)
-    agent.setup_github_repository(url=args.url, commit=args.commit)
+
+    # Avoid setup_github_repository() because LeanAgent hardcodes build_deps=True.
+    # We keep build_deps as an explicit CLI knob for stable experiments.
+    traced_repo = agent.trace_repository(
+        url=args.url, commit=args.commit, build_deps=args.build_deps
+    )
+    agent.add_repository(traced_repo)
 
     # Same theorem pool for all variants.
     theorem_repo_pairs = []
@@ -299,6 +311,7 @@ def main() -> None:
     summary: Dict[str, object] = {
         "url": args.url,
         "commit": args.commit,
+        "build_deps": args.build_deps,
         "max_theorems": args.max_theorems,
         "variants": variants,
         "results": {},
@@ -312,6 +325,7 @@ def main() -> None:
             gen_ckpt_path=args.gen_ckpt_path,
             corpus_jsonl_path=corpus_jsonl_path,
             max_theorems=args.max_theorems,
+            build_deps=args.build_deps,
         )
         all_rows.extend(rows)
         summary["results"][variant] = summarize_rows(rows)
