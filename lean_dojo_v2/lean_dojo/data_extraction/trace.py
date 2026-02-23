@@ -49,6 +49,26 @@ def _modify_dependency_files(packages_path: Path) -> None:
                 f.write(modified_content)
 
 
+def _sanitize_public_import_all(packages_path: Path) -> None:
+    """Normalize invalid `public import all` back to `import all`.
+
+    Some previous runs or legacy logic may rewrite dependency files into a form
+    rejected by newer Lean versions. We sanitize before extraction so tracing
+    is deterministic across environments.
+    """
+    logger.debug("Sanitizing dependency files: 'public import all' -> 'import all'")
+    for lean_file in packages_path.rglob("*.lean"):
+        with open(lean_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        sanitized = re.sub(
+            r"^(\s*)public import all", r"\1import all", content, flags=re.MULTILINE
+        )
+        if sanitized != content:
+            with open(lean_file, "w", encoding="utf-8") as f:
+                f.write(sanitized)
+
+
 def _monitor(paths: List[Path], num_total: int) -> None:
     with tqdm(total=num_total) as pbar:
         while True:
@@ -208,8 +228,23 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
             Path(lean_prefix), str(packages_path / "lean4"), dirs_exist_ok=True
         )
 
-        # Modify dependency files to replace 'import all' with 'public import all'
+        # Always sanitize dependency files first to avoid parse failures caused
+        # by invalid `public import all` directives.
         if build_deps:
+            _sanitize_public_import_all(packages_path)
+
+        # NOTE:
+        # Rewriting `import all` to `public import all` is incompatible with
+        # newer Lean stdlib files and can cause deterministic parse failures
+        # ("cannot use `all` with `public import`").
+        #
+        # Keep this rewrite disabled by default. Enable only if explicitly
+        # requested for legacy environments.
+        if build_deps and os.getenv("LEAN_DOJO_REWRITE_IMPORT_ALL", "0") == "1":
+            logger.warning(
+                "Rewriting dependency imports is enabled via "
+                "LEAN_DOJO_REWRITE_IMPORT_ALL=1. This may break on newer Lean versions."
+            )
             _modify_dependency_files(packages_path)
 
         # Run ExtractData.lean to extract ASTs, tactic states, and premise information.

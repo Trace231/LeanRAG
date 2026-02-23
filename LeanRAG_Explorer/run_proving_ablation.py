@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import re
 from pathlib import Path
 from statistics import mean
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from loguru import logger
@@ -19,6 +20,11 @@ from lean_dojo_v2.lean_dojo.data_extraction.lean import LeanGitRepo, Pos
 from lean_dojo_v2.lean_dojo.data_extraction.trace import get_traced_repo_path
 from lean_dojo_v2.prover.retrieval_prover import RetrievalProver
 from lean_dojo_v2.utils.constants import RAID_DIR
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore[assignment]
 
 
 def _split_state(state: str) -> Tuple[List[str], str]:
@@ -108,12 +114,27 @@ class AblationRetrievalProver(RetrievalProver):
         gen_ckpt_path: str,
         indexed_corpus_path: str,
         variant: str,
+        summary_alpha: float = 0.7,
+        summary_model: str = "gpt-4o-mini",
+        summary_max_output_tokens: int = 120,
+        summary_temperature: float = 0.1,
     ):
         super().__init__(ret_ckpt_path, gen_ckpt_path, indexed_corpus_path)
         self.variant = variant
+        self.summary_alpha = float(summary_alpha)
+        self.summary_model = summary_model
+        self.summary_max_output_tokens = int(summary_max_output_tokens)
+        self.summary_temperature = float(summary_temperature)
         self._history_by_theorem: Dict[str, List[str]] = {}
         self._state_history_by_theorem: Dict[str, List[str]] = {}
         self._ctx_by_theorem: Dict[str, Dict[str, object]] = {}
+        self._summary_cache: Dict[str, str] = {}
+        self._summary_client = None
+        if OpenAI is not None and os.getenv("OPENAI_API_KEY"):
+            try:
+                self._summary_client = OpenAI()
+            except Exception:
+                self._summary_client = None
 
         original = self.tactic_generator.retriever
         if original is None:
@@ -173,6 +194,74 @@ class AblationRetrievalProver(RetrievalProver):
 
             return path
 
+        def premise_key(premise: Any) -> Tuple[str, str, Tuple[int, int]]:
+            path = str(getattr(premise, "path", ""))
+            full_name = str(getattr(premise, "full_name", ""))
+            start = getattr(premise, "start", None)
+            if start is None:
+                return path, full_name, (0, 0)
+            return path, full_name, tuple(start)
+
+        def normalize(scores: List[float]) -> List[float]:
+            if not scores:
+                return []
+            low = min(scores)
+            high = max(scores)
+            if high == low:
+                return [1.0 for _ in scores]
+            return [(s - low) / (high - low) for s in scores]
+
+        def build_summary_query(state_text: str, thm_name: str) -> str:
+            ctx = self._ctx_by_theorem.get(thm_name, {})
+            recent_states = list(ctx.get("recent_states", []))[-3:]
+            recent_tactics = list(ctx.get("recent_tactics", []))[-8:]
+            cache_key = "||".join(
+                [
+                    thm_name,
+                    state_text,
+                    "\n".join(recent_states),
+                    "\n".join(recent_tactics),
+                ]
+            )
+            cached = self._summary_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            fallback_summary = (
+                "Proof trajectory summary: "
+                + (" | ".join(recent_tactics) if recent_tactics else "No recent tactics")
+                + f"\nCurrent objective:\n{state_text}"
+            )
+            if self._summary_client is None:
+                self._summary_cache[cache_key] = fallback_summary
+                return fallback_summary
+
+            prompt = (
+                "You are helping retrieval for Lean theorem proving.\n"
+                "Write one concise retrieval query describing what the proof is doing now.\n"
+                "Focus on goal intent, key objects, and useful lemma direction.\n"
+                "Output plain text only.\n\n"
+                f"Current state:\n{state_text}\n\n"
+                f"Recent states:\n{chr(10).join(recent_states) if recent_states else '(none)'}\n\n"
+                f"Recent tactics:\n{chr(10).join(recent_tactics) if recent_tactics else '(none)'}\n"
+            )
+            try:
+                resp = self._summary_client.responses.create(
+                    model=self.summary_model,
+                    input=prompt,
+                    max_output_tokens=self.summary_max_output_tokens,
+                    temperature=self.summary_temperature,
+                )
+                summary = (resp.output_text or "").strip()
+                if summary:
+                    self._summary_cache[cache_key] = summary
+                    return summary
+            except Exception:
+                pass
+
+            self._summary_cache[cache_key] = fallback_summary
+            return fallback_summary
+
         def patched_retrieve(
             state: List[str],
             file_name: List[str],
@@ -180,8 +269,70 @@ class AblationRetrievalProver(RetrievalProver):
             theorem_pos: List[Pos],
             k: int,
         ):
-            transformed: List[str] = []
             resolved_file_names: List[str] = []
+            for p in file_name:
+                resolved_file_names.append(resolve_file_path(p))
+
+            if self.variant == "dual_summary_fusion":
+                state_results = original_retrieve(
+                    state,
+                    resolved_file_names,
+                    theorem_full_name,
+                    theorem_pos,
+                    k,
+                )
+                summary_queries = [
+                    build_summary_query(s, thm_name)
+                    for s, thm_name in zip(state, theorem_full_name)
+                ]
+                summary_results = original_retrieve(
+                    summary_queries,
+                    resolved_file_names,
+                    theorem_full_name,
+                    theorem_pos,
+                    k,
+                )
+                state_premises_batch, state_scores_batch = state_results
+                sum_premises_batch, sum_scores_batch = summary_results
+                fused_premises_batch = []
+                fused_scores_batch = []
+                for st_premises, st_scores, su_premises, su_scores in zip(
+                    state_premises_batch,
+                    state_scores_batch,
+                    sum_premises_batch,
+                    sum_scores_batch,
+                ):
+                    st_norm = normalize([float(x) for x in st_scores])
+                    su_norm = normalize([float(x) for x in su_scores])
+                    fused_by_key: Dict[Tuple[str, str, Tuple[int, int]], Dict[str, Any]] = {}
+                    for premise, score in zip(st_premises, st_norm):
+                        fused_by_key[premise_key(premise)] = {
+                            "premise": premise,
+                            "state": score,
+                            "summary": 0.0,
+                        }
+                    for premise, score in zip(su_premises, su_norm):
+                        key = premise_key(premise)
+                        if key not in fused_by_key:
+                            fused_by_key[key] = {
+                                "premise": premise,
+                                "state": 0.0,
+                                "summary": score,
+                            }
+                        else:
+                            fused_by_key[key]["summary"] = score
+                    fused_items = []
+                    alpha = min(max(self.summary_alpha, 0.0), 1.0)
+                    for payload in fused_by_key.values():
+                        fused_score = alpha * payload["state"] + (1.0 - alpha) * payload["summary"]
+                        fused_items.append((payload["premise"], float(fused_score)))
+                    fused_items.sort(key=lambda x: x[1], reverse=True)
+                    fused_items = fused_items[:k]
+                    fused_premises_batch.append([p for p, _ in fused_items])
+                    fused_scores_batch.append([s for _, s in fused_items])
+                return fused_premises_batch, fused_scores_batch
+
+            transformed: List[str] = []
             for s, thm_name in zip(state, theorem_full_name):
                 ctx = self._ctx_by_theorem.get(thm_name, {})
                 theorem_statement = str(ctx.get("theorem_statement", ""))
@@ -196,8 +347,6 @@ class AblationRetrievalProver(RetrievalProver):
                         recent_states=recent_states,
                     )
                 )
-            for p in file_name:
-                resolved_file_names.append(resolve_file_path(p))
             return original_retrieve(
                 transformed,
                 resolved_file_names,
@@ -259,12 +408,20 @@ def run_variant(
     corpus_jsonl_path: str,
     max_theorems: int,
     build_deps: bool,
+    summary_alpha: float,
+    summary_model: str,
+    summary_max_output_tokens: int,
+    summary_temperature: float,
 ) -> List[Dict[str, object]]:
     prover = AblationRetrievalProver(
         ret_ckpt_path=ret_ckpt_path,
         gen_ckpt_path=gen_ckpt_path,
         indexed_corpus_path=corpus_jsonl_path,
         variant=variant,
+        summary_alpha=summary_alpha,
+        summary_model=summary_model,
+        summary_max_output_tokens=summary_max_output_tokens,
+        summary_temperature=summary_temperature,
     )
 
     rows: List[Dict[str, object]] = []
@@ -348,13 +505,36 @@ def main() -> None:
     parser.add_argument("--max-theorems", type=int, default=50)
     parser.add_argument(
         "--variants",
-        default="raw_state,goal_only,macro_context,temporal_context,recent_states_context,denoised_state",
+        default="raw_state,goal_only,macro_context,temporal_context,recent_states_context,denoised_state,dual_summary_fusion",
         help="Comma-separated query variants.",
     )
     parser.add_argument("--ret-ckpt-path", default="")
     parser.add_argument("--gen-ckpt-path", default=f"{RAID_DIR}/model_lightning.ckpt")
     parser.add_argument("--corpus-jsonl-path", default="")
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument(
+        "--summary-alpha",
+        type=float,
+        default=0.7,
+        help="Fusion weight for state retrieval in dual_summary_fusion.",
+    )
+    parser.add_argument(
+        "--summary-model",
+        default="gpt-4o-mini",
+        help="LLM model for summary retrieval query generation.",
+    )
+    parser.add_argument(
+        "--summary-max-output-tokens",
+        type=int,
+        default=120,
+        help="Max output tokens for LLM summary generation.",
+    )
+    parser.add_argument(
+        "--summary-temperature",
+        type=float,
+        default=0.1,
+        help="Temperature for LLM summary generation.",
+    )
     parser.add_argument(
         "--build-deps",
         action="store_true",
@@ -432,6 +612,10 @@ def main() -> None:
             corpus_jsonl_path=corpus_jsonl_path,
             max_theorems=args.max_theorems,
             build_deps=args.build_deps,
+            summary_alpha=args.summary_alpha,
+            summary_model=args.summary_model,
+            summary_max_output_tokens=args.summary_max_output_tokens,
+            summary_temperature=args.summary_temperature,
         )
         all_rows.extend(rows)
         summary["results"][variant] = summarize_rows(rows)
