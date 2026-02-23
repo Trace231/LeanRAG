@@ -224,21 +224,43 @@ class Corpus:
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
 
         self.imported_premises_cache = {}
+        self.path_resolution_cache = {}
         self.fill_cache()
 
-    def _get_file(self, path: str) -> File:
-        # for some reason, the `path` in the parameter starts with ./
-        # but the paths in the corpus don't
-        # so we need to remove the ./
-        if path.startswith("./"):
-            path = path[2:]
+    def _resolve_path(self, path: str) -> Optional[str]:
+        """Resolve a context path to a node key in the dependency graph.
 
-        if path not in self.transitive_dep_graph:
+        We frequently see small path format mismatches between theorem metadata
+        and corpus keys (e.g., `./Foo.lean` vs `Foo.lean`, or suffix-only paths).
+        This resolver normalizes and performs a conservative suffix match.
+        """
+        cached = self.path_resolution_cache.get(path)
+        if cached is not None:
+            return cached
+
+        normalized = path[2:] if path.startswith("./") else path
+        if normalized in self.transitive_dep_graph:
+            self.path_resolution_cache[path] = normalized
+            return normalized
+
+        # Fallback: suffix match, e.g. "Lean4Example.lean" against
+        # "lean4-example/Lean4Example.lean".
+        candidates = [p for p in self.transitive_dep_graph.nodes if p.endswith(normalized)]
+        if len(candidates) == 1:
+            self.path_resolution_cache[path] = candidates[0]
+            return candidates[0]
+
+        self.path_resolution_cache[path] = None
+        return None
+
+    def _get_file(self, path: str) -> File:
+        resolved = self._resolve_path(path)
+        if resolved is None:
             logger.warning(f"File {path} not found in dependency graph.")
             # Return an empty file to avoid KeyError
             return File(path=path, premises=[])
 
-        return self.transitive_dep_graph.nodes[path]["file"]
+        return self.transitive_dep_graph.nodes[resolved]["file"]
 
     def __len__(self) -> int:
         return len(self.all_premises)
@@ -259,7 +281,10 @@ class Corpus:
 
     def get_dependencies(self, path: str) -> List[str]:
         """Return a list of (direct and indirect) dependencies of the file ``path``."""
-        return list(self.transitive_dep_graph.successors(path))
+        resolved = self._resolve_path(path)
+        if resolved is None:
+            return []
+        return list(self.transitive_dep_graph.successors(resolved))
 
     def get_premises(self, path: str) -> List[Premise]:
         """Return a list of premises defined in the file ``path``."""
@@ -287,14 +312,18 @@ class Corpus:
 
     def _get_imported_premises(self, path: str) -> List[Premise]:
         """Return a list of premises imported in file ``path``. The result is cached."""
-        premises = self.imported_premises_cache.get(path, None)
+        resolved = self._resolve_path(path)
+        if resolved is None:
+            return []
+
+        premises = self.imported_premises_cache.get(resolved, None)
         if premises is not None:
             return premises
 
         premises = []
-        for p in self.transitive_dep_graph.successors(path):
+        for p in self.transitive_dep_graph.successors(resolved):
             premises.extend(self._get_file(p).premises)
-        self.imported_premises_cache[path] = premises
+        self.imported_premises_cache[resolved] = premises
         return premises
 
     def get_accessible_premises(self, path: str, pos: Pos) -> PremiseSet:
@@ -309,11 +338,12 @@ class Corpus:
         return premises
 
     def get_accessible_premise_indexes(self, path: str, pos: Pos) -> List[int]:
+        resolved = self._resolve_path(path)
         return [
             i
             for i, p in enumerate(self.all_premises)
-            if (p.path == path and p.end <= pos)
-            or self.transitive_dep_graph.has_edge(path, p.path)
+            if (resolved is not None and p.path == resolved and p.end <= pos)
+            or (resolved is not None and self.transitive_dep_graph.has_edge(resolved, p.path))
         ]
 
     def get_nearest_premises(
