@@ -334,11 +334,11 @@ private def visitTermInfo (ti : TermInfo) (env : Environment) : TraceM Unit := d
   let fileMap ← getFileMap
 
   let posBefore := match ti.toElabInfo.stx.getPos? with
-    | some posInfo => fileMap.toPosition posInfo
+    | some posInfo => some (fileMap.toPosition posInfo)
     | none => none
 
   let posAfter := match ti.toElabInfo.stx.getTailPos? with
-    | some posInfo => fileMap.toPosition posInfo
+    | some posInfo => some (fileMap.toPosition posInfo)
     | none => none
 
   let decRanges ← withEnv env $ findDeclarationRanges? fullName
