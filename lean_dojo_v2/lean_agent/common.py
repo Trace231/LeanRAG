@@ -243,9 +243,23 @@ class Corpus:
             self.path_resolution_cache[path] = normalized
             return normalized
 
-        # Fallback: suffix match, e.g. "Lean4Example.lean" against
+        # Fallback 1: exact suffix match, e.g. "Lean4Example.lean" against
         # "lean4-example/Lean4Example.lean".
         candidates = [p for p in self.transitive_dep_graph.nodes if p.endswith(normalized)]
+        if len(candidates) == 1:
+            self.path_resolution_cache[path] = candidates[0]
+            return candidates[0]
+
+        # Fallback 2: normalize .lean extension mismatches.
+        alt = normalized[:-5] if normalized.endswith(".lean") else normalized + ".lean"
+        candidates = [p for p in self.transitive_dep_graph.nodes if p.endswith(alt)]
+        if len(candidates) == 1:
+            self.path_resolution_cache[path] = candidates[0]
+            return candidates[0]
+
+        # Fallback 3: basename match (conservative; only if unique).
+        basename = normalized.split("/")[-1]
+        candidates = [p for p in self.transitive_dep_graph.nodes if p.split("/")[-1] == basename]
         if len(candidates) == 1:
             self.path_resolution_cache[path] = candidates[0]
             return candidates[0]
@@ -371,7 +385,13 @@ class Corpus:
                     if len(results[j]) >= k:
                         break
             else:
-                raise ValueError
+                # Fallback: if no premise passes accessibility filtering due to
+                # path mismatch/incomplete corpus metadata, keep proving alive
+                # by returning top-k unfiltered retrievals.
+                for i in idxs[:k]:
+                    p = self.all_premises[i]
+                    results[j].append(p)
+                    scores[j].append(similarities[j, i].item())
 
         return results, scores
 
