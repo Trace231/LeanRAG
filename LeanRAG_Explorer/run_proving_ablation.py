@@ -426,6 +426,12 @@ def _parse_pos_like(value: Any, field_name: str) -> Pos:
     raise ValueError(f"Invalid {field_name}: expected [line,col] or Pos(...), got {value!r}")
 
 
+def _parse_optional_pos_like(value: Any, field_name: str) -> Optional[Pos]:
+    if value is None:
+        return None
+    return _parse_pos_like(value, field_name)
+
+
 def _load_dataset_rows(dataset_path: str) -> List[Dict[str, Any]]:
     path = Path(dataset_path)
     if not path.exists():
@@ -449,10 +455,40 @@ def _build_theorem_repo_pairs_from_dataset(
     dataset_path: str,
     default_url: Optional[str],
     default_commit: Optional[str],
+    agent: Optional[LeanAgent] = None,
+    build_deps: bool = False,
+    reuse_db: bool = False,
 ) -> List[Tuple[Theorem, LeanGitRepo]]:
     rows = _load_dataset_rows(dataset_path)
     repo_cache: Dict[Tuple[str, str], LeanGitRepo] = {}
     pairs: List[Tuple[Theorem, LeanGitRepo]] = []
+    seen_ids: set[Tuple[str, str, str, str, Optional[Tuple[int, int]], Optional[Tuple[int, int]]]] = set()
+    unresolved_count = 0
+
+    repo_record_cache: Dict[Tuple[str, str], Any] = {}
+
+    def get_repo_record(url: str, commit: str):
+        if agent is None:
+            return None
+        key = (url, commit)
+        if key in repo_record_cache:
+            return repo_record_cache[key]
+
+        repo_record = None
+        if reuse_db:
+            repo_record = agent.database.get_repository(url, commit)
+            if repo_record is not None:
+                logger.info("Dataset mode reused repository from DB: {} @ {}", url, commit)
+
+        if repo_record is None:
+            traced_repo = agent.trace_repository(url=url, commit=commit, build_deps=build_deps)
+            if traced_repo is None:
+                raise RuntimeError(f"Failed to trace repository for dataset row: {url}@{commit}")
+            agent.add_repository(traced_repo)
+            repo_record = agent.database.get_repository(url, commit)
+
+        repo_record_cache[key] = repo_record
+        return repo_record
 
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
@@ -472,8 +508,37 @@ def _build_theorem_repo_pairs_from_dataset(
                 f"Dataset row {i} missing full_name/theorem_full_name or file_path."
             )
 
-        start = _parse_pos_like(row.get("start"), "start")
-        end = _parse_pos_like(row.get("end"), "end")
+        start = _parse_optional_pos_like(row.get("start"), "start")
+        end = _parse_optional_pos_like(row.get("end"), "end")
+        if end is None and start is not None:
+            end = start
+
+        if start is None or end is None:
+            repo_record = get_repo_record(url, commit)
+            if repo_record is not None:
+                matched = repo_record.get_theorem(full_name, file_path)
+                if matched is not None:
+                    start = matched.start
+                    end = matched.end
+                    if not row.get("theorem_statement"):
+                        row["theorem_statement"] = matched.theorem_statement
+
+        if start is None or end is None:
+            unresolved_count += 1
+            continue
+
+        dedup_id = (
+            url,
+            commit,
+            file_path,
+            full_name,
+            tuple(start),
+            tuple(end),
+        )
+        if dedup_id in seen_ids:
+            continue
+        seen_ids.add(dedup_id)
+
         theorem_statement = row.get("theorem_statement")
         theorem = Theorem(
             full_name=full_name,
@@ -492,7 +557,17 @@ def _build_theorem_repo_pairs_from_dataset(
         pairs.append((theorem, repo_cache[key]))
 
     if not pairs:
+        if unresolved_count > 0:
+            raise RuntimeError(
+                "Dataset mode found no theorem rows. "
+                f"All rows were unresolved (likely missing theorem positions): {unresolved_count} rows."
+            )
         raise RuntimeError("Dataset mode found no theorem rows.")
+    if unresolved_count > 0:
+        logger.warning(
+            "Dataset mode skipped {} rows because theorem positions could not be resolved.",
+            unresolved_count,
+        )
     return pairs
 
 
@@ -673,10 +748,14 @@ def main() -> None:
     agent: Optional[LeanAgent] = None
 
     if dataset_mode:
+        agent = LeanAgent(database_path=args.database_path)
         theorem_repo_pairs = _build_theorem_repo_pairs_from_dataset(
             dataset_path=args.dataset_path.strip(),
             default_url=args.url.strip() or None,
             default_commit=args.commit.strip() or None,
+            agent=agent,
+            build_deps=args.build_deps,
+            reuse_db=args.reuse_db,
         )
         logger.info(
             "Loaded {} theorem tasks from dataset mode: {}",

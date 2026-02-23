@@ -66,28 +66,37 @@ def _to_proving_row(
     theorem_statement = _pick(record, "theorem_statement", "statement")
     theorem_statement = str(theorem_statement) if theorem_statement is not None else ""
 
-    if not (url and commit and full_name and file_path and start and end):
+    # Some SFT datasets (e.g. tactic-step data) do not ship theorem start/end positions.
+    # We still keep these rows; start/end can be backfilled later from traced repo metadata.
+    if not (url and commit and full_name and file_path):
         return None
 
-    return {
+    row = {
         "url": url,
         "commit": commit,
         "full_name": full_name,
         "file_path": file_path,
-        "start": start,
-        "end": end,
         "theorem_statement": theorem_statement,
     }
+    if start is not None:
+        row["start"] = start
+    if end is not None:
+        row["end"] = end
+    return row
 
 
-def _dedup_key(row: Dict[str, Any]) -> Tuple[str, str, str, str, Tuple[int, int], Tuple[int, int]]:
+def _dedup_key(
+    row: Dict[str, Any],
+) -> Tuple[str, str, str, str, Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    start = row.get("start")
+    end = row.get("end")
     return (
         row["url"],
         row["commit"],
         row["file_path"],
         row["full_name"],
-        tuple(row["start"]),
-        tuple(row["end"]),
+        tuple(start) if isinstance(start, (list, tuple)) and len(start) == 2 else None,
+        tuple(end) if isinstance(end, (list, tuple)) and len(end) == 2 else None,
     )
 
 
@@ -125,6 +134,7 @@ def main() -> None:
     seen = set()
     kept: List[Dict[str, Any]] = []
     skipped = 0
+    with_positions = 0
 
     for rec in _iter_records(ds):
         row = _to_proving_row(rec, args.default_url, args.default_commit)
@@ -135,6 +145,8 @@ def main() -> None:
         if key in seen:
             continue
         seen.add(key)
+        if "start" in row and "end" in row:
+            with_positions += 1
         kept.append(row)
         if args.max_rows > 0 and len(kept) >= args.max_rows:
             break
@@ -151,6 +163,7 @@ def main() -> None:
                 "output": str(out_path),
                 "num_rows": len(kept),
                 "num_skipped_missing_fields": skipped,
+                "num_rows_with_positions": with_positions,
             },
             indent=2,
             ensure_ascii=False,

@@ -49,13 +49,15 @@
 
 ## 3) 当前实现内容
 
-### 3.1 Query 改造（5 个主变体）
+### 3.1 Query 改造（7 个主变体）
 
 - `raw_state`：原始 state（基线）
 - `goal_only`：只保留 goal
 - `macro_context`：theorem statement + state
 - `temporal_context`：近期 tactic 历史 + state
 - `denoised_state`：goal + 关键词筛选 hypothesis
+- `recent_states_context`：近期 3 条 state + 当前 state
+- `dual_summary_fusion`：state 检索 + LLM 历史总结检索，归一化后加权融合
 
 ### 3.2 检索模块
 
@@ -128,6 +130,8 @@ python scripts/bootstrap_retrieval_assets.py --build-deps
 
 ### 6.3 proving 消融（先小样本烟测）
 
+#### A) repo 模式（原始方式）
+
 ```bash
 ROOT="$PWD"
 RET_CKPT="$(python - <<'PY'
@@ -148,6 +152,40 @@ python LeanRAG_Explorer/run_proving_ablation.py \
 ```
 
 通过后再把 `--max-theorems` 提升到 20/50。
+
+#### B) dataset 模式（推荐用于固定数据集复现实验）
+
+先从 Hugging Face 下载并去重（去重键：`url+commit+file_path+full_name+start+end`）：
+
+```bash
+python scripts/download_hf_proving_dataset.py \
+  --dataset "cat-searcher/leandojo-benchmark-4-random-sft" \
+  --split train \
+  --output outputs/datasets/leandojo_benchmark4_proving_dedup.jsonl
+```
+
+然后直接按 dataset 跑 proving 消融（不再需要 `--url/--commit`）：
+
+```bash
+ROOT="$PWD"
+RET_CKPT="$(python - <<'PY'
+from lean_dojo_v2.utils.filesystem import find_latest_checkpoint
+print(find_latest_checkpoint())
+PY
+)"
+
+python LeanRAG_Explorer/run_proving_ablation.py \
+  --dataset-path "outputs/datasets/leandojo_benchmark4_proving_dedup.jsonl" \
+  --database-path "dynamic_database.json" \
+  --reuse-db \
+  --output-dir "outputs/proving_ablation" \
+  --max-theorems 50 \
+  --ret-ckpt-path "$RET_CKPT" \
+  --gen-ckpt-path "$ROOT/raid/model_lightning.ckpt" \
+  --corpus-jsonl-path "$ROOT/raid/data/merged/corpus.jsonl"
+```
+
+若要跑纯生成组（不检索），将 `--ret-ckpt-path ""`，并省略 `--corpus-jsonl-path`。
 
 ---
 
