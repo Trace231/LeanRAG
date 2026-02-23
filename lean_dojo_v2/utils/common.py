@@ -105,9 +105,30 @@ def execute(
     try:
         res = subprocess.run(cmd, shell=True, capture_output=capture_output, check=True)
     except subprocess.CalledProcessError as ex:
-        if capture_output:
-            logger.info(ex.stdout.decode())
-            logger.error(ex.stderr.decode())
+        # Always print subprocess outputs when available so Lean/Lake failures
+        # are visible instead of being hidden behind CalledProcessError.
+        stdout = ex.stdout
+        stderr = ex.stderr
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="ignore")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="ignore")
+
+        print("\n" + "=" * 40)
+        print("LEAN/LAKE COMMAND FAILED")
+        print(f"CMD: {cmd}")
+        print("-" * 40)
+        print("STDERR:")
+        print(stderr or "<empty>")
+        print("-" * 40)
+        print("STDOUT:")
+        print(stdout or "<empty>")
+        print("=" * 40 + "\n")
+
+        if capture_output and stdout:
+            logger.info(stdout)
+        if capture_output and stderr:
+            logger.error(stderr)
         raise ex
     if not capture_output:
         return None
