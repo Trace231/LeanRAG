@@ -211,6 +211,18 @@ class AblationRetrievalProver(RetrievalProver):
                 return [1.0 for _ in scores]
             return [(s - low) / (high - low) for s in scores]
 
+        def ensure_retriever_state(query: str, fallback_state: str) -> str:
+            """Ensure query satisfies Lean retriever Context format constraints.
+
+            The underlying `Context` object asserts that `state` contains `⊢`.
+            """
+            text = (query or "").strip()
+            if not text:
+                return fallback_state
+            if "⊢" in text:
+                return text
+            return f"⊢ {text}"
+
         def build_summary_query(state_text: str, thm_name: str) -> str:
             ctx = self._ctx_by_theorem.get(thm_name, {})
             recent_states = list(ctx.get("recent_states", []))[-3:]
@@ -282,7 +294,7 @@ class AblationRetrievalProver(RetrievalProver):
                     k,
                 )
                 summary_queries = [
-                    build_summary_query(s, thm_name)
+                    ensure_retriever_state(build_summary_query(s, thm_name), s)
                     for s, thm_name in zip(state, theorem_full_name)
                 ]
                 summary_results = original_retrieve(
@@ -338,7 +350,7 @@ class AblationRetrievalProver(RetrievalProver):
                 theorem_statement = str(ctx.get("theorem_statement", ""))
                 recent_tactics = list(ctx.get("recent_tactics", []))
                 recent_states = list(ctx.get("recent_states", []))
-                transformed.append(
+                transformed_query = (
                     build_query_variant(
                         self.variant,
                         s,
@@ -347,6 +359,7 @@ class AblationRetrievalProver(RetrievalProver):
                         recent_states=recent_states,
                     )
                 )
+                transformed.append(ensure_retriever_state(transformed_query, s))
             return original_retrieve(
                 transformed,
                 resolved_file_names,
