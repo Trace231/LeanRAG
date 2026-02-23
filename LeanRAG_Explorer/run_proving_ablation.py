@@ -118,6 +118,43 @@ class AblationRetrievalProver(RetrievalProver):
         """
 
         original_retrieve = retriever_module.retrieve
+        corpus_nodes: List[str] = []
+        try:
+            corpus_nodes = list(retriever_module.corpus.transitive_dep_graph.nodes)
+        except Exception:
+            corpus_nodes = []
+
+        def resolve_file_path(path: str) -> str:
+            """Map theorem file path to a corpus node path when possible."""
+            if not corpus_nodes:
+                return path
+            if path in corpus_nodes:
+                return path
+
+            normalized = path[2:] if path.startswith("./") else path
+            if normalized in corpus_nodes:
+                return normalized
+
+            # Suffix match first.
+            suffix_matches = [p for p in corpus_nodes if p.endswith(normalized)]
+            if len(suffix_matches) == 1:
+                return suffix_matches[0]
+
+            # Extension normalization.
+            alt = (
+                normalized[:-5] if normalized.endswith(".lean") else normalized + ".lean"
+            )
+            suffix_matches = [p for p in corpus_nodes if p.endswith(alt)]
+            if len(suffix_matches) == 1:
+                return suffix_matches[0]
+
+            # Basename unique match as last resort.
+            basename = normalized.split("/")[-1]
+            base_matches = [p for p in corpus_nodes if p.split("/")[-1] == basename]
+            if len(base_matches) == 1:
+                return base_matches[0]
+
+            return path
 
         def patched_retrieve(
             state: List[str],
@@ -127,6 +164,7 @@ class AblationRetrievalProver(RetrievalProver):
             k: int,
         ):
             transformed: List[str] = []
+            resolved_file_names: List[str] = []
             for s, thm_name in zip(state, theorem_full_name):
                 ctx = self._ctx_by_theorem.get(thm_name, {})
                 theorem_statement = str(ctx.get("theorem_statement", ""))
@@ -139,9 +177,11 @@ class AblationRetrievalProver(RetrievalProver):
                         recent_tactics=recent_tactics,
                     )
                 )
+            for p in file_name:
+                resolved_file_names.append(resolve_file_path(p))
             return original_retrieve(
                 transformed,
-                file_name,
+                resolved_file_names,
                 theorem_full_name,
                 theorem_pos,
                 k,
