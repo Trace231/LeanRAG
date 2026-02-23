@@ -248,16 +248,15 @@ def export_premises(traced_repo: TracedRepo, dst_path: Path) -> tuple[int, int]:
 
     with corpus_path.open("wt") as output:
         graph = traced_repo.traced_files_graph
+        wrote_any_file = False
 
-        if not graph:
-            logger.warning("No traced files found in repository")
-            pass
-        else:
+        if graph is not None and graph.number_of_nodes() > 0:
             for node in reversed(list(nx.topological_sort(graph))):
                 traced_file = graph.nodes[node]["traced_file"]
                 imports = [str(imp) for imp in graph.successors(node)]
                 premises = traced_file.get_premise_definitions()
                 num_premises += len(premises)
+                wrote_any_file = True
 
                 output.write(
                     json.dumps(
@@ -269,6 +268,25 @@ def export_premises(traced_repo: TracedRepo, dst_path: Path) -> tuple[int, int]:
                     )
                     + "\n"
                 )
+        elif traced_repo.traced_files:
+            # noDeps mode does not build traced_files_graph; fall back to traced_files.
+            for traced_file in traced_repo.traced_files:
+                premises = traced_file.get_premise_definitions()
+                num_premises += len(premises)
+                wrote_any_file = True
+                output.write(
+                    json.dumps(
+                        {
+                            "path": str(traced_file.path),
+                            "imports": [],
+                            "premises": premises,
+                        }
+                    )
+                    + "\n"
+                )
+
+        if not wrote_any_file:
+            logger.warning("No traced files found in repository")
 
     logger.info(
         f"Exported {num_premises} premises from "
