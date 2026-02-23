@@ -53,6 +53,7 @@ def build_query_variant(
     state: str,
     theorem_statement: str,
     recent_tactics: List[str],
+    recent_states: Optional[List[str]] = None,
 ) -> str:
     """Build transformed retrieval query from original proof state.
 
@@ -80,6 +81,15 @@ def build_query_variant(
         history = "\n".join(f"- {t}" for t in tail)
         return f"Recent tactics:\n{history}\n\nCurrent state:\n{state}"
 
+    if variant == "recent_states_context":
+        tail_states = (recent_states or [])[-3:]
+        if not tail_states:
+            return state
+        history = "\n\n".join(
+            f"State -{len(tail_states) - i}:\n{s}" for i, s in enumerate(tail_states)
+        )
+        return f"Recent states:\n{history}\n\nCurrent state:\n{state}"
+
     if variant == "denoised_state":
         selected = _goal_keyword_filter(goal, hyps, top_n=6)
         if selected:
@@ -102,6 +112,7 @@ class AblationRetrievalProver(RetrievalProver):
         super().__init__(ret_ckpt_path, gen_ckpt_path, indexed_corpus_path)
         self.variant = variant
         self._history_by_theorem: Dict[str, List[str]] = {}
+        self._state_history_by_theorem: Dict[str, List[str]] = {}
         self._ctx_by_theorem: Dict[str, Dict[str, object]] = {}
 
         original = self.tactic_generator.retriever
@@ -175,12 +186,14 @@ class AblationRetrievalProver(RetrievalProver):
                 ctx = self._ctx_by_theorem.get(thm_name, {})
                 theorem_statement = str(ctx.get("theorem_statement", ""))
                 recent_tactics = list(ctx.get("recent_tactics", []))
+                recent_states = list(ctx.get("recent_states", []))
                 transformed.append(
                     build_query_variant(
                         self.variant,
                         s,
                         theorem_statement=theorem_statement,
                         recent_tactics=recent_tactics,
+                        recent_states=recent_states,
                     )
                 )
             for p in file_name:
@@ -203,9 +216,12 @@ class AblationRetrievalProver(RetrievalProver):
         theorem_name = self.theorem.full_name
         if theorem_name not in self._history_by_theorem:
             self._history_by_theorem[theorem_name] = []
+        if theorem_name not in self._state_history_by_theorem:
+            self._state_history_by_theorem[theorem_name] = []
         self._ctx_by_theorem[theorem_name] = {
             "theorem_statement": getattr(self.theorem, "theorem_statement", "") or "",
             "recent_tactics": self._history_by_theorem[theorem_name],
+            "recent_states": self._state_history_by_theorem[theorem_name],
         }
 
         suggestions = self.tactic_generator.generate(
@@ -221,6 +237,10 @@ class AblationRetrievalProver(RetrievalProver):
         probs = np.exp(log_probs) / np.sum(np.exp(log_probs))
         selected = random.choices(tactics, weights=probs, k=1)[0]
         self._history_by_theorem[theorem_name].append(str(selected))
+        cur_state = str(state)
+        recent_states = self._state_history_by_theorem[theorem_name]
+        if not recent_states or recent_states[-1] != cur_state:
+            recent_states.append(cur_state)
         return selected
 
 
@@ -328,7 +348,7 @@ def main() -> None:
     parser.add_argument("--max-theorems", type=int, default=50)
     parser.add_argument(
         "--variants",
-        default="raw_state,goal_only,macro_context,temporal_context,denoised_state",
+        default="raw_state,goal_only,macro_context,temporal_context,recent_states_context,denoised_state",
         help="Comma-separated query variants.",
     )
     parser.add_argument("--ret-ckpt-path", default="")

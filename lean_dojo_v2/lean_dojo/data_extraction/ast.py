@@ -121,19 +121,21 @@ class Node:
 
 def _parse_pos(
     info: Dict[str, Any], lean_file: LeanFile
-) -> Optional[Tuple[Optional[Pos], Optional[Pos]]]:
+) -> Tuple[Optional[Pos], Optional[Pos]]:
     if "synthetic" in info and not info["synthetic"]["canonical"]:
-        return None
+        return None, None
 
     if (
         "original" in info
     ):  # | original (leading : Substring) (pos : String.Pos) (trailing : Substring) (endPos : String.Pos)
         start, end = info["original"]["pos"], info["original"]["endPos"]
     else:
-        assert (
-            "synthetic" in info
-        )  # | synthetic (pos : String.Pos) (endPos : String.Pos) (canonical := false)
-        start, end = info["synthetic"]["pos"], info["synthetic"]["endPos"]
+        synthetic = info.get("synthetic")
+        if synthetic is None:
+            # Newer/variant Lean AST payloads may omit both `original` and
+            # `synthetic` in edge cases. Keep parsing resilient.
+            return None, None
+        start, end = synthetic["pos"], synthetic["endPos"]
 
     start = lean_file.position_to_pos(start)
     end = lean_file.position_to_pos(end)
@@ -158,9 +160,9 @@ class AtomNode(Node):
             leading = info["original"]["leading"]
             trailing = info["original"]["trailing"]
         else:
-            assert "synthetic" in info
-            leading = info["synthetic"]["leading"]
-            trailing = info["synthetic"]["trailing"]
+            synthetic = info.get("synthetic")
+            leading = synthetic.get("leading", "") if synthetic is not None else ""
+            trailing = synthetic.get("trailing", "") if synthetic is not None else ""
 
         return cls(lean_file, start, end, [], leading, trailing, atom_data["val"])
 
@@ -190,9 +192,9 @@ class IdentNode(Node):
             leading = info["original"]["leading"]
             trailing = info["original"]["trailing"]
         else:
-            assert "synthetic" in info
-            leading = info["synthetic"]["leading"]
-            trailing = info["synthetic"]["trailing"]
+            synthetic = info.get("synthetic")
+            leading = synthetic.get("leading", "") if synthetic is not None else ""
+            trailing = synthetic.get("trailing", "") if synthetic is not None else ""
 
         return cls(
             lean_file,
