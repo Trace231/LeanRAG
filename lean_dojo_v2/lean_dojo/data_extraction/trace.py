@@ -6,6 +6,7 @@ A repo has to be traced only once, and the traced repo will be stored in a cache
 import itertools
 import os
 import re
+import shlex
 import shutil
 from contextlib import contextmanager
 from multiprocessing import Process
@@ -27,6 +28,7 @@ from .traced_data import TracedRepo
 LEAN4_DATA_EXTRACTOR_PATH = Path(__file__).with_name("ExtractData.lean")
 
 _PROGRESSBAR_UPDATE_INTERNAL = 5
+_FAILED_PROCESS_PATTERN = re.compile(r"WARNING: Failed to process (?P<path>.+)")
 
 
 def _modify_dependency_files(packages_path: Path) -> None:
@@ -137,6 +139,47 @@ def check_files(packages_path: Path, no_deps: bool) -> None:
             logger.warning(f"Missing {p}")
 
 
+def _extract_failed_paths(stdout: str, stderr: str) -> List[str]:
+    failed_paths: List[str] = []
+    seen = set()
+    for text in (stdout or "", stderr or ""):
+        for line in text.splitlines():
+            m = _FAILED_PROCESS_PATTERN.search(line.strip())
+            if m is None:
+                continue
+            path = m.group("path").strip()
+            if path not in seen:
+                seen.add(path)
+                failed_paths.append(path)
+    return failed_paths
+
+
+def _repair_failed_files_sequentially(failed_paths: List[str]) -> List[str]:
+    if not failed_paths:
+        return []
+    logger.warning(
+        "Initial extraction failed for {} files. Starting sequential repair.",
+        len(failed_paths),
+    )
+    still_failed: List[str] = []
+    for path in failed_paths:
+        try:
+            execute(
+                f"lake env lean --run ExtractData.lean {shlex.quote(path)}",
+                capture_output=False,
+            )
+        except Exception as e:
+            logger.warning(f"Sequential repair failed for {path}: {e}")
+            still_failed.append(path)
+    repaired = len(failed_paths) - len(still_failed)
+    logger.info(
+        "Sequential repair finished: repaired {} / {} failed files.",
+        repaired,
+        len(failed_paths),
+    )
+    return still_failed
+
+
 def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
     assert (
         repo.exists()
@@ -179,7 +222,14 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
             cmd = f"lake env lean --threads {NUM_PROCS} --run ExtractData.lean"
             if not build_deps:
                 cmd += " noDeps"
-            execute(cmd)
+            output, error = execute(cmd, capture_output=True)  # type: ignore[misc]
+        failed_paths = _extract_failed_paths(output, error)
+        still_failed = _repair_failed_files_sequentially(failed_paths)
+        if still_failed:
+            logger.warning(
+                "Ignoring {} files that still failed after sequential repair.",
+                len(still_failed),
+            )
 
         check_files(packages_path, not build_deps)
         os.remove(LEAN4_DATA_EXTRACTOR_PATH.name)

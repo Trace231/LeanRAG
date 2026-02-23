@@ -488,24 +488,25 @@ def shouldProcess (path : FilePath) (noDeps : Bool) : IO Bool := do
 Trace all *.lean files in the current directory whose corresponding *.olean file exists.
 -/
 def processAllFiles (noDeps : Bool) : IO Unit := do
-    let cwd ← IO.currentDir
-    assert! cwd.fileName != "lean4"
-    println! "Extracting data at {cwd}"
+  let cwd ← IO.currentDir
+  assert! cwd.fileName != "lean4"
+  println! "Extracting data at {cwd}"
 
-    let mut tasks := #[]
-    for path in ← System.FilePath.walkDir cwd do
-      if ← shouldProcess path noDeps then
-        let t ← IO.asTask $ IO.Process.run
+  -- First pass: high-throughput parallel extraction.
+  -- A second-pass sequential repair is orchestrated in Python (trace.py).
+  let mut tasks := #[]
+  for path in ← System.FilePath.walkDir cwd do
+    if ← shouldProcess path noDeps then
+      let t ← IO.asTask <| IO.Process.run
           {cmd := "lake", args := #["env", "lean", "--run", "ExtractData.lean", path.toString]}
-        tasks := tasks.push (t, path)
+      tasks := tasks.push (t, path)
 
-    for (t, path) in tasks do
-      match ← IO.wait t with
-      | Except.error _ =>
+  for (t, path) in tasks do
+    match ← IO.wait t with
+    | Except.error e =>
         println! s!"WARNING: Failed to process {path}"
-        pure ()
-        -- throw e
-      | Except.ok _ => pure ()
+        println! s!"ERROR: {e.toString}"
+    | Except.ok _ => pure ()
 
 
 unsafe def main (args : List String) : IO Unit := do
