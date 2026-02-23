@@ -120,8 +120,11 @@ class Node:
 
 
 def _parse_pos(
-    info: Dict[str, Any], lean_file: LeanFile
+    info: Any, lean_file: LeanFile
 ) -> Tuple[Optional[Pos], Optional[Pos]]:
+    if not isinstance(info, dict):
+        return None, None
+
     if "synthetic" in info and not info["synthetic"]["canonical"]:
         return None, None
 
@@ -153,14 +156,15 @@ class AtomNode(Node):
     def from_data(
         cls, atom_data: Dict[str, Any], lean_file: LeanFile
     ) -> Optional["AtomNode"]:
-        info = atom_data["info"]
+        info = atom_data.get("info", {})
+        info_dict = info if isinstance(info, dict) else {}
         start, end = _parse_pos(info, lean_file)
 
-        if "original" in info:
-            leading = info["original"]["leading"]
-            trailing = info["original"]["trailing"]
+        if "original" in info_dict:
+            leading = info_dict["original"]["leading"]
+            trailing = info_dict["original"]["trailing"]
         else:
-            synthetic = info.get("synthetic")
+            synthetic = info_dict.get("synthetic")
             leading = synthetic.get("leading", "") if synthetic is not None else ""
             trailing = synthetic.get("trailing", "") if synthetic is not None else ""
 
@@ -184,15 +188,16 @@ class IdentNode(Node):
     def from_data(
         cls, ident_data: Dict[str, Any], lean_file: LeanFile
     ) -> Optional["IdentNode"]:
-        info = ident_data["info"]
+        info = ident_data.get("info", {})
+        info_dict = info if isinstance(info, dict) else {}
         start, end = _parse_pos(info, lean_file)
         assert ident_data["preresolved"] == []
 
-        if "original" in info:
-            leading = info["original"]["leading"]
-            trailing = info["original"]["trailing"]
+        if "original" in info_dict:
+            leading = info_dict["original"]["leading"]
+            trailing = info_dict["original"]["trailing"]
         else:
-            synthetic = info.get("synthetic")
+            synthetic = info_dict.get("synthetic")
             leading = synthetic.get("leading", "") if synthetic is not None else ""
             trailing = synthetic.get("trailing", "") if synthetic is not None else ""
 
