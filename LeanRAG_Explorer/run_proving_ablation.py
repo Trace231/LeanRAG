@@ -10,14 +10,15 @@ from statistics import mean
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from loguru import logger
 from pantograph import Server
 
 from lean_dojo_v2.agent.lean_agent import LeanAgent
+from lean_dojo_v2.lean_agent.common import Corpus
 from lean_dojo_v2.lean_dojo.data_extraction.lean import LeanGitRepo, Pos
 from lean_dojo_v2.lean_dojo.data_extraction.trace import get_traced_repo_path
 from lean_dojo_v2.prover.retrieval_prover import RetrievalProver
 from lean_dojo_v2.utils.constants import RAID_DIR
-from lean_dojo_v2.utils.filesystem import find_latest_checkpoint
 
 
 def _split_state(state: str) -> Tuple[List[str], str]:
@@ -93,7 +94,7 @@ class AblationRetrievalProver(RetrievalProver):
 
     def __init__(
         self,
-        ret_ckpt_path: str,
+        ret_ckpt_path: Optional[str],
         gen_ckpt_path: str,
         indexed_corpus_path: str,
         variant: str,
@@ -104,8 +105,13 @@ class AblationRetrievalProver(RetrievalProver):
         self._ctx_by_theorem: Dict[str, Dict[str, object]] = {}
 
         original = self.tactic_generator.retriever
-        assert original is not None, "Retriever must be loaded for retrieval ablation."
-        self._install_query_transform_patch(original)
+        if original is None:
+            logger.info(
+                "Retriever is disabled (generator-only mode). "
+                "Query transformation patch is skipped."
+            )
+        else:
+            self._install_query_transform_patch(original)
 
     def _install_query_transform_patch(self, retriever_module: object) -> None:
         """Patch retriever.retrieve without replacing the nn.Module instance.
@@ -228,7 +234,7 @@ def _safe_float(x) -> float:
 def run_variant(
     variant: str,
     theorem_repo_pairs,
-    ret_ckpt_path: str,
+    ret_ckpt_path: Optional[str],
     gen_ckpt_path: str,
     corpus_jsonl_path: str,
     max_theorems: int,
@@ -262,6 +268,23 @@ def run_variant(
             }
         )
     return rows
+
+
+def _run_corpus_consistency_precheck(
+    theorem_repo_pairs, corpus_jsonl_path: str
+) -> None:
+    """Fail fast if theorem file paths cannot be resolved in the retrieval corpus."""
+    sample_theorem, _ = random.choice(theorem_repo_pairs)
+    sample_path = str(sample_theorem.file_path)
+    corpus = Corpus(corpus_jsonl_path)
+    _ = corpus._get_file(sample_path)
+    if corpus._resolve_path(sample_path) is None:
+        raise RuntimeError(
+            "Retrieval precheck failed: current corpus.jsonl does not include the target "
+            f"file path '{sample_path}'. Please regenerate corpus data for the current "
+            "repository/commit or fix path mapping."
+        )
+    logger.info("Retrieval precheck passed for theorem file path: {}", sample_path)
 
 
 def summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
@@ -334,6 +357,12 @@ def main() -> None:
     traced_repo = None
     if args.reuse_db:
         traced_repo = agent.database.get_repository(args.url, args.commit)
+        if traced_repo is not None:
+            logger.info(
+                "Reused repository from dynamic database: {} @ {}",
+                args.url,
+                args.commit,
+            )
     if traced_repo is None:
         traced_repo = agent.trace_repository(
             url=args.url, commit=args.commit, build_deps=args.build_deps
@@ -349,11 +378,19 @@ def main() -> None:
     if not theorem_repo_pairs:
         raise RuntimeError("No sorry theorems found in repository.")
 
-    ret_ckpt_path = args.ret_ckpt_path or find_latest_checkpoint()
-    if not ret_ckpt_path:
-        raise RuntimeError("Cannot find retriever checkpoint. Pass --ret-ckpt-path.")
+    retrieval_enabled = bool(args.ret_ckpt_path and args.ret_ckpt_path.strip())
+    ret_ckpt_path = args.ret_ckpt_path.strip() if retrieval_enabled else ""
+    if retrieval_enabled:
+        logger.info("Retrieval checkpoint provided. Performing consistency precheck.")
+    else:
+        logger.info(
+            "No retrieval checkpoint provided. Skipping consistency check and running in generator-only mode."
+        )
 
-    corpus_jsonl_path = args.corpus_jsonl_path or str(agent.data_path / "corpus.jsonl")
+    corpus_jsonl_path = ""
+    if retrieval_enabled:
+        corpus_jsonl_path = args.corpus_jsonl_path or str(agent.data_path / "corpus.jsonl")
+        _run_corpus_consistency_precheck(theorem_repo_pairs, corpus_jsonl_path)
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
 
     all_rows: List[Dict[str, object]] = []
@@ -370,7 +407,7 @@ def main() -> None:
         rows = run_variant(
             variant=variant,
             theorem_repo_pairs=theorem_repo_pairs,
-            ret_ckpt_path=ret_ckpt_path,
+            ret_ckpt_path=ret_ckpt_path if retrieval_enabled else None,
             gen_ckpt_path=args.gen_ckpt_path,
             corpus_jsonl_path=corpus_jsonl_path,
             max_theorems=args.max_theorems,

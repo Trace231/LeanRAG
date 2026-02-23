@@ -225,6 +225,8 @@ class Corpus:
 
         self.imported_premises_cache = {}
         self.path_resolution_cache = {}
+        self._consecutive_path_miss_count = 0
+        self._path_miss_fail_threshold = 5
         self.fill_cache()
 
     def _resolve_path(self, path: str) -> Optional[str]:
@@ -270,10 +272,24 @@ class Corpus:
     def _get_file(self, path: str) -> File:
         resolved = self._resolve_path(path)
         if resolved is None:
-            logger.warning(f"File {path} not found in dependency graph.")
+            self._consecutive_path_miss_count += 1
+            logger.warning(
+                "File {} not found in dependency graph (consecutive misses: {}/{}).",
+                path,
+                self._consecutive_path_miss_count,
+                self._path_miss_fail_threshold,
+            )
+            if self._consecutive_path_miss_count >= self._path_miss_fail_threshold:
+                raise RuntimeError(
+                    "Retrieval corpus path mismatch detected: failed to resolve "
+                    f"file path '{path}' for {self._consecutive_path_miss_count} "
+                    "consecutive retrieval requests. Please verify that "
+                    "`corpus_jsonl_path` matches the traced repository/commit "
+                    "used in this run."
+                )
             # Return an empty file to avoid KeyError
             return File(path=path, premises=[])
-
+        self._consecutive_path_miss_count = 0
         return self.transitive_dep_graph.nodes[resolved]["file"]
 
     def __len__(self) -> int:

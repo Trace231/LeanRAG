@@ -54,9 +54,21 @@ class DynamicDatabase:
 
         self.json_path = json_path
         self.repositories = []
-
-        logger.info(f"Initializing new database at {self.json_path}")
-        self.to_json(self.json_path)
+        if os.path.exists(self.json_path):
+            if os.path.getsize(self.json_path) > 0:
+                logger.info(f"Loading existing database from {self.json_path}")
+                self._load_from_json(self.json_path)
+                logger.info(
+                    f"Loaded {len(self.repositories)} repositories from existing database."
+                )
+            else:
+                logger.info(
+                    f"Database file {self.json_path} is empty. Initializing a new database."
+                )
+                self.to_json(self.json_path)
+        else:
+            logger.info(f"Initializing new database at {self.json_path}")
+            self.to_json(self.json_path)
 
     SPLIT = Dict[str, List[Theorem]]
 
@@ -343,7 +355,10 @@ class DynamicDatabase:
     def from_dict(cls, data: Dict) -> DynamicDatabase:
         if "repositories" not in data:
             raise ValueError("Invalid DynamicDatabase data format")
-        db = cls()
+        # Avoid side effects from __init__ (file loading/writing) during pure in-memory deserialization.
+        db = cls.__new__(cls)
+        db.json_path = "dynamic_database.json"
+        db.repositories = []
         for repo_data in data["repositories"]:
             repo = Repository.from_dict(repo_data)
             db.add_repository(repo)
@@ -359,9 +374,7 @@ class DynamicDatabase:
     @classmethod
     def from_json(cls, file_path: str) -> DynamicDatabase:
         """Create a new instance from JSON file."""
-        db = cls()
-        db._load_from_json(file_path)
-        return db
+        return cls(json_path=file_path)
 
     def update_json(self, file_path: str) -> None:
         """Update an existing JSON file with the current database state."""
