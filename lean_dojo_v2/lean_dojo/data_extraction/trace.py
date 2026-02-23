@@ -335,9 +335,36 @@ def trace(
             not dst_dir.exists()
         ), f"The destination directory {dst_dir} already exists."
 
+    rel_cache_dir = repo.get_cache_dirname() / (
+        repo.name + ("_d" if build_deps else "")
+    )
     cached_path = get_traced_repo_path(repo, build_deps)
     logger.info(f"Loading the traced repo from {cached_path}")
-    traced_repo = TracedRepo.load_from_disk(cached_path, build_deps)
+    try:
+        traced_repo = TracedRepo.load_from_disk(cached_path, build_deps)
+    except RuntimeError as e:
+        # Corrupted/incomplete cache can miss git metadata. Recover by rebuilding once.
+        if "is not a Git repo" not in str(e):
+            raise
+        logger.warning(
+            "Cached traced repo looks invalid (not a Git repo): {}. Rebuilding cache entry.",
+            cached_path,
+        )
+        if Path(cached_path).exists():
+            shutil.rmtree(cached_path, ignore_errors=True)
+        with working_directory() as tmp_dir:
+            logger.debug(
+                "Re-tracing {} in temporary directory {} after cache recovery.",
+                repo,
+                tmp_dir,
+            )
+            _trace(repo, build_deps)
+            src_dir = tmp_dir / repo.name
+            traced_repo = TracedRepo.from_traced_files(src_dir, build_deps)
+            traced_repo.save_to_disk()
+            cached_path = cache.store(src_dir, rel_cache_dir)
+        logger.info("Retry loading rebuilt traced repo from {}", cached_path)
+        traced_repo = TracedRepo.load_from_disk(cached_path, build_deps)
     traced_repo.check_sanity()
 
     if dst_dir is not None:
