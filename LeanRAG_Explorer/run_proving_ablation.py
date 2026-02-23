@@ -464,6 +464,15 @@ def _run_corpus_consistency_precheck(
     logger.info("Retrieval precheck passed for theorem file path: {}", sample_path)
 
 
+def _candidate_repo_corpus_path(theorem_repo_pairs) -> Optional[str]:
+    """Return traced-repo corpus path candidate for the current theorem pool."""
+    if not theorem_repo_pairs:
+        return None
+    _, repo = theorem_repo_pairs[0]
+    candidate = Path(RAID_DIR) / "data" / str(repo) / "corpus.jsonl"
+    return str(candidate) if candidate.exists() else None
+
+
 def summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
     if not rows:
         return {
@@ -590,7 +599,24 @@ def main() -> None:
     corpus_jsonl_path = ""
     if retrieval_enabled:
         corpus_jsonl_path = args.corpus_jsonl_path or str(agent.data_path / "corpus.jsonl")
-        _run_corpus_consistency_precheck(theorem_repo_pairs, corpus_jsonl_path)
+        try:
+            _run_corpus_consistency_precheck(theorem_repo_pairs, corpus_jsonl_path)
+        except RuntimeError as e:
+            fallback_corpus = _candidate_repo_corpus_path(theorem_repo_pairs)
+            if fallback_corpus and Path(fallback_corpus) != Path(corpus_jsonl_path):
+                logger.warning(
+                    "Provided corpus failed consistency precheck: {}. "
+                    "Trying traced-repo corpus fallback: {}",
+                    e,
+                    fallback_corpus,
+                )
+                _run_corpus_consistency_precheck(theorem_repo_pairs, fallback_corpus)
+                corpus_jsonl_path = fallback_corpus
+                logger.info(
+                    "Using traced-repo corpus after fallback: {}", corpus_jsonl_path
+                )
+            else:
+                raise
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
 
     all_rows: List[Dict[str, object]] = []
