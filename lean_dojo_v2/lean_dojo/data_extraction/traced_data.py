@@ -965,6 +965,56 @@ def _build_dependency_graph(
     return G
 
 
+def _build_seed_only_dependency_graph(
+    seed_files: List[TracedFile], repo: LeanGitRepo
+) -> nx.DiGraph:
+    """Build a best-effort dependency graph only among already traced seed files.
+
+    This fallback avoids hard failure when full dependency loading fails due to
+    partial traces in external packages/toolchain mismatch.
+    """
+    G = nx.DiGraph()
+    for tf in seed_files:
+        G.add_node(str(tf.path), traced_file=tf)
+
+    known_paths = set(G.nodes)
+    for tf in seed_files:
+        tf_path_str = str(tf.path)
+        try:
+            direct_deps = tf.get_direct_dependencies(repo)
+        except Exception as e:
+            logger.warning(f"Failed to read direct dependencies for {tf.path}: {e}")
+            continue
+        for dep_module, dep_path in direct_deps:
+            dep_path_str = str(dep_path)
+            if dep_path_str in known_paths:
+                G.add_edge(tf_path_str, dep_path_str, module=dep_module)
+
+    if not nx.is_directed_acyclic_graph(G):
+        logger.warning(
+            "Seed-only dependency graph is not a DAG; falling back to graph without edges."
+        )
+        G = nx.DiGraph()
+        for tf in seed_files:
+            G.add_node(str(tf.path), traced_file=tf)
+    return G
+
+
+def _build_dependency_graph_with_fallback(
+    seed_files: List[TracedFile], root_dir: Path, repo: LeanGitRepo
+) -> nx.DiGraph:
+    """Build full dependency graph and gracefully degrade on failures."""
+    try:
+        return _build_dependency_graph(seed_files, root_dir, repo)
+    except Exception as e:
+        logger.warning(
+            "Full dependency graph construction failed: {}. "
+            "Falling back to seed-only dependency graph.",
+            e,
+        )
+        return _build_seed_only_dependency_graph(seed_files, repo)
+
+
 @dataclass(frozen=True, eq=False)
 class TracedRepo:
     """A traced repo is a Lean repo of traced files and additional information, such as
@@ -1089,7 +1139,9 @@ class TracedRepo:
 
         dependencies = repo.get_dependencies(root_dir)
         if build_deps:
-            traced_files_graph = _build_dependency_graph(traced_files, root_dir, repo)
+            traced_files_graph = _build_dependency_graph_with_fallback(
+                traced_files, root_dir, repo
+            )
         else:
             traced_files_graph = None
 
@@ -1147,7 +1199,9 @@ class TracedRepo:
 
         dependencies = repo.get_dependencies(root_dir)
         if build_deps:
-            traced_files_graph = _build_dependency_graph(traced_files, root_dir, repo)
+            traced_files_graph = _build_dependency_graph_with_fallback(
+                traced_files, root_dir, repo
+            )
         else:
             traced_files_graph = None
 
