@@ -15,6 +15,7 @@ from loguru import logger
 from pantograph import Server
 
 from lean_dojo_v2.agent.lean_agent import LeanAgent
+from lean_dojo_v2.database.models.theorems import Theorem
 from lean_dojo_v2.lean_agent.common import Corpus
 from lean_dojo_v2.lean_dojo.data_extraction.lean import LeanGitRepo, Pos
 from lean_dojo_v2.lean_dojo.data_extraction.trace import get_traced_repo_path
@@ -413,6 +414,88 @@ def _safe_float(x) -> float:
         return 0.0
 
 
+def _parse_pos_like(value: Any, field_name: str) -> Pos:
+    if isinstance(value, Pos):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return Pos(int(value[0]), int(value[1]))
+    if isinstance(value, str):
+        m = re.match(r"Pos\((\d+),\s*(\d+)\)", value.strip())
+        if m is not None:
+            return Pos(int(m.group(1)), int(m.group(2)))
+    raise ValueError(f"Invalid {field_name}: expected [line,col] or Pos(...), got {value!r}")
+
+
+def _load_dataset_rows(dataset_path: str) -> List[Dict[str, Any]]:
+    path = Path(dataset_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
+    if path.suffix == ".jsonl":
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if isinstance(payload.get("samples"), list):
+            return payload["samples"]
+        if isinstance(payload.get("theorems"), list):
+            return payload["theorems"]
+    raise ValueError(
+        "Unsupported dataset format. Expected JSONL records or JSON list/`samples`/`theorems`."
+    )
+
+
+def _build_theorem_repo_pairs_from_dataset(
+    dataset_path: str,
+    default_url: Optional[str],
+    default_commit: Optional[str],
+) -> List[Tuple[Theorem, LeanGitRepo]]:
+    rows = _load_dataset_rows(dataset_path)
+    repo_cache: Dict[Tuple[str, str], LeanGitRepo] = {}
+    pairs: List[Tuple[Theorem, LeanGitRepo]] = []
+
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Dataset row {i} is not an object: {row!r}")
+
+        url = str(row.get("url") or default_url or "").strip()
+        commit = str(row.get("commit") or default_commit or "").strip()
+        if not url or not commit:
+            raise ValueError(
+                f"Dataset row {i} missing url/commit. Provide fields per row or pass --url/--commit as defaults."
+            )
+
+        full_name = str(row.get("full_name") or row.get("theorem_full_name") or "").strip()
+        file_path = str(row.get("file_path") or "").strip()
+        if not full_name or not file_path:
+            raise ValueError(
+                f"Dataset row {i} missing full_name/theorem_full_name or file_path."
+            )
+
+        start = _parse_pos_like(row.get("start"), "start")
+        end = _parse_pos_like(row.get("end"), "end")
+        theorem_statement = row.get("theorem_statement")
+        theorem = Theorem(
+            full_name=full_name,
+            file_path=Path(file_path),
+            start=start,
+            end=end,
+            url=url,
+            commit=commit,
+            theorem_statement=str(theorem_statement) if theorem_statement is not None else None,
+            traced_tactics=[],
+        )
+
+        key = (url, commit)
+        if key not in repo_cache:
+            repo_cache[key] = LeanGitRepo(url, commit)
+        pairs.append((theorem, repo_cache[key]))
+
+    if not pairs:
+        raise RuntimeError("Dataset mode found no theorem rows.")
+    return pairs
+
+
 def run_variant(
     variant: str,
     theorem_repo_pairs,
@@ -520,8 +603,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="End-to-end proving ablation by query-stage retrieval variants."
     )
-    parser.add_argument("--url", required=True, help="GitHub repository URL.")
-    parser.add_argument("--commit", required=True, help="Commit hash.")
+    parser.add_argument(
+        "--url",
+        default="",
+        help="GitHub repository URL (required unless --dataset-path is provided).",
+    )
+    parser.add_argument(
+        "--commit",
+        default="",
+        help="Commit hash (required unless --dataset-path is provided).",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        default="",
+        help="Optional JSON/JSONL theorem dataset for dataset-driven proving mode.",
+    )
     parser.add_argument("--database-path", default="dynamic_database.json")
     parser.add_argument("--output-dir", default="outputs/proving_ablation")
     parser.add_argument("--max-theorems", type=int, default=50)
@@ -572,33 +668,49 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    agent = LeanAgent(database_path=args.database_path)
+    dataset_mode = bool(args.dataset_path.strip())
+    theorem_repo_pairs: List[Tuple[Theorem, LeanGitRepo]] = []
+    agent: Optional[LeanAgent] = None
 
-    # Avoid setup_github_repository() because LeanAgent hardcodes build_deps=True.
-    # We keep build_deps as an explicit CLI knob for stable experiments.
-    traced_repo = None
-    if args.reuse_db:
-        traced_repo = agent.database.get_repository(args.url, args.commit)
-        if traced_repo is not None:
-            logger.info(
-                "Reused repository from dynamic database: {} @ {}",
-                args.url,
-                args.commit,
-            )
-    if traced_repo is None:
-        traced_repo = agent.trace_repository(
-            url=args.url, commit=args.commit, build_deps=args.build_deps
+    if dataset_mode:
+        theorem_repo_pairs = _build_theorem_repo_pairs_from_dataset(
+            dataset_path=args.dataset_path.strip(),
+            default_url=args.url.strip() or None,
+            default_commit=args.commit.strip() or None,
         )
-    agent.add_repository(traced_repo)
+        logger.info(
+            "Loaded {} theorem tasks from dataset mode: {}",
+            len(theorem_repo_pairs),
+            args.dataset_path,
+        )
+    else:
+        if not args.url.strip() or not args.commit.strip():
+            raise RuntimeError("Repo mode requires both --url and --commit.")
+        agent = LeanAgent(database_path=args.database_path)
+        # Avoid setup_github_repository() because LeanAgent hardcodes build_deps=True.
+        # We keep build_deps as an explicit CLI knob for stable experiments.
+        traced_repo = None
+        if args.reuse_db:
+            traced_repo = agent.database.get_repository(args.url, args.commit)
+            if traced_repo is not None:
+                logger.info(
+                    "Reused repository from dynamic database: {} @ {}",
+                    args.url,
+                    args.commit,
+                )
+        if traced_repo is None:
+            traced_repo = agent.trace_repository(
+                url=args.url, commit=args.commit, build_deps=args.build_deps
+            )
+        agent.add_repository(traced_repo)
 
-    # Same theorem pool for all variants.
-    theorem_repo_pairs = []
-    for repo in agent.repos:
-        repository = agent.database.get_repository(repo.url, repo.commit)
-        for theorem in repository.sorry_theorems_unproved:
-            theorem_repo_pairs.append((theorem, repo))
-    if not theorem_repo_pairs:
-        raise RuntimeError("No sorry theorems found in repository.")
+        # Same theorem pool for all variants.
+        for repo in agent.repos:
+            repository = agent.database.get_repository(repo.url, repo.commit)
+            for theorem in repository.sorry_theorems_unproved:
+                theorem_repo_pairs.append((theorem, repo))
+        if not theorem_repo_pairs:
+            raise RuntimeError("No sorry theorems found in repository.")
 
     retrieval_enabled = bool(args.ret_ckpt_path and args.ret_ckpt_path.strip())
     ret_ckpt_path = args.ret_ckpt_path.strip() if retrieval_enabled else ""
@@ -611,7 +723,15 @@ def main() -> None:
 
     corpus_jsonl_path = ""
     if retrieval_enabled:
-        corpus_jsonl_path = args.corpus_jsonl_path or str(agent.data_path / "corpus.jsonl")
+        default_corpus = ""
+        if not dataset_mode:
+            assert agent is not None
+            default_corpus = str(agent.data_path / "corpus.jsonl")
+        corpus_jsonl_path = args.corpus_jsonl_path or default_corpus
+        if not corpus_jsonl_path:
+            raise RuntimeError(
+                "Dataset mode with retrieval enabled requires --corpus-jsonl-path."
+            )
         try:
             _run_corpus_consistency_precheck(theorem_repo_pairs, corpus_jsonl_path)
         except RuntimeError as e:
@@ -634,8 +754,10 @@ def main() -> None:
 
     all_rows: List[Dict[str, object]] = []
     summary: Dict[str, object] = {
-        "url": args.url,
-        "commit": args.commit,
+        "mode": "dataset" if dataset_mode else "repo",
+        "url": args.url if args.url else None,
+        "commit": args.commit if args.commit else None,
+        "dataset_path": args.dataset_path if dataset_mode else None,
         "build_deps": args.build_deps,
         "max_theorems": args.max_theorems,
         "variants": variants,
