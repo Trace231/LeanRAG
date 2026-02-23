@@ -1429,9 +1429,13 @@ class CommandModuledocNode(Node):
         assert node_data["info"] == "none"
         start, end = None, None
         children = _parse_children(node_data, lean_file)
-        assert len(children) == 2 and all(isinstance(_, AtomNode) for _ in children)
-        assert children[0].val == "/-!"
-        comment = children[1].val
+        comment = ""
+        atom_children = [c for c in children if isinstance(c, AtomNode)]
+        if len(atom_children) >= 2 and atom_children[0].val == "/-!":
+            comment = atom_children[1].val
+        elif atom_children:
+            # Be robust to parser shape changes in newer Lean versions.
+            comment = atom_children[-1].val
         return cls(lean_file, start, end, children, comment)
 
 
@@ -1446,9 +1450,12 @@ class CommandDoccommentNode(Node):
         assert node_data["info"] == "none"
         start, end = None, None
         children = _parse_children(node_data, lean_file)
-        assert len(children) == 2 and all(isinstance(_, AtomNode) for _ in children)
-        assert children[0].val == "/--"
-        comment = children[1].val
+        comment = ""
+        atom_children = [c for c in children if isinstance(c, AtomNode)]
+        if len(atom_children) >= 2 and atom_children[0].val == "/--":
+            comment = atom_children[1].val
+        elif atom_children:
+            comment = atom_children[-1].val
         return cls(lean_file, start, end, children, comment)
 
 
