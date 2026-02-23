@@ -277,6 +277,11 @@ def main() -> None:
         action="store_true",
         help="Enable full dependency tracing. Default is False (noDeps).",
     )
+    parser.add_argument(
+        "--reuse-db",
+        action="store_true",
+        help="Reuse repository from dynamic_database.json if available before tracing.",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -286,9 +291,13 @@ def main() -> None:
 
     # Avoid setup_github_repository() because LeanAgent hardcodes build_deps=True.
     # We keep build_deps as an explicit CLI knob for stable experiments.
-    traced_repo = agent.trace_repository(
-        url=args.url, commit=args.commit, build_deps=args.build_deps
-    )
+    traced_repo = None
+    if args.reuse_db:
+        traced_repo = agent.database.get_repository(args.url, args.commit)
+    if traced_repo is None:
+        traced_repo = agent.trace_repository(
+            url=args.url, commit=args.commit, build_deps=args.build_deps
+        )
     agent.add_repository(traced_repo)
 
     # Same theorem pool for all variants.

@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 from lean_dojo_v2.agent.lean_agent import LeanAgent
 
@@ -18,6 +19,11 @@ def main() -> None:
         action="store_true",
         help="Enable full dependency tracing. Default is False (noDeps).",
     )
+    parser.add_argument(
+        "--skip-train",
+        action="store_true",
+        help="Only trace/export merged data. Skip retriever training.",
+    )
     args = parser.parse_args()
 
     agent = LeanAgent(database_path=args.database_path)
@@ -28,9 +34,21 @@ def main() -> None:
         url=args.url, commit=args.commit, build_deps=args.build_deps
     )
     agent.add_repository(traced_repo)
+    # Always export merged data so corpus.jsonl is available for proving.
+    merged_path = Path("raid/data/merged")
+    agent.database.export_merged_data([traced_repo], merged_path)
+
+    if args.skip_train:
+        print(
+            f"bootstrap done (trace/export only, build_deps={args.build_deps}) "
+            f"for {args.url}@{args.commit}"
+        )
+        return
+
     agent.train()
     print(
-        f"bootstrap done (build_deps={args.build_deps}) for {args.url}@{args.commit}"
+        f"bootstrap done (build_deps={args.build_deps}, trained=True) "
+        f"for {args.url}@{args.commit}"
     )
 
 
