@@ -31,6 +31,28 @@ _PROGRESSBAR_UPDATE_INTERNAL = 5
 _FAILED_PROCESS_PATTERN = re.compile(r"WARNING: Failed to process (?P<path>.+)")
 
 
+def _read_repo_toolchain(repo_dir: Path) -> Optional[str]:
+    toolchain_file = repo_dir / "lean-toolchain"
+    if not toolchain_file.exists():
+        return None
+    raw = toolchain_file.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None
+    return raw.splitlines()[0].strip()
+
+
+def _with_toolchain(cmd: str, toolchain: Optional[str]) -> str:
+    if not toolchain:
+        return cmd
+    return f"elan run {shlex.quote(toolchain)} {cmd}"
+
+
+def _get_lean_version(toolchain: Optional[str]) -> str:
+    output = execute(_with_toolchain("lean --version", toolchain), capture_output=True)[0].strip()
+    m = re.match(r"Lean \(version (?P<version>\S+?),", output)
+    return m["version"]  # type: ignore[index]
+
+
 def _modify_dependency_files(packages_path: Path) -> None:
     """Modify dependency files to replace 'import all' with 'public import all'."""
     logger.debug(
@@ -174,7 +196,9 @@ def _extract_failed_paths(stdout: str, stderr: str) -> List[str]:
     return failed_paths
 
 
-def _repair_failed_files_sequentially(failed_paths: List[str]) -> List[str]:
+def _repair_failed_files_sequentially(
+    failed_paths: List[str], toolchain: Optional[str]
+) -> List[str]:
     if not failed_paths:
         return []
     logger.warning(
@@ -185,7 +209,10 @@ def _repair_failed_files_sequentially(failed_paths: List[str]) -> List[str]:
     for path in failed_paths:
         try:
             execute(
-                f"lake env lean --run ExtractData.lean {shlex.quote(path)}",
+                _with_toolchain(
+                    f"lake env lean --run ExtractData.lean {shlex.quote(path)}",
+                    toolchain,
+                ),
                 capture_output=False,
             )
         except Exception as e:
@@ -212,12 +239,17 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
     logger.debug(f"Tracing {repo}")
 
     with working_directory(repo.name):
+        repo_toolchain = _read_repo_toolchain(Path.cwd())
+        if repo_toolchain:
+            logger.info("Tracing with repo toolchain: {}", repo_toolchain)
         # Build the repo using lake.
-        execute("lake build")
+        execute(_with_toolchain("lake build", repo_toolchain))
 
         # Copy the Lean 4 stdlib into the path of packages.
-        lean_prefix = execute(f"lean --print-prefix", capture_output=True)[0].strip()
-        if is_new_version(get_lean_version()):
+        lean_prefix = execute(
+            _with_toolchain("lean --print-prefix", repo_toolchain), capture_output=True
+        )[0].strip()
+        if is_new_version(_get_lean_version(repo_toolchain)):
             packages_path = Path(".lake/packages")
             build_path = Path(".lake/build")
         else:
@@ -257,9 +289,11 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
             cmd = f"lake env lean --threads {NUM_PROCS} --run ExtractData.lean"
             if not build_deps:
                 cmd += " noDeps"
-            output, error = execute(cmd, capture_output=True)  # type: ignore[misc]
+            output, error = execute(
+                _with_toolchain(cmd, repo_toolchain), capture_output=True
+            )  # type: ignore[misc]
         failed_paths = _extract_failed_paths(output, error)
-        still_failed = _repair_failed_files_sequentially(failed_paths)
+        still_failed = _repair_failed_files_sequentially(failed_paths, repo_toolchain)
         if still_failed:
             logger.warning(
                 "Ignoring {} files that still failed after sequential repair.",
