@@ -346,7 +346,7 @@ private def visitTermInfo (ti : TermInfo) (env : Environment) : TraceM Unit := d
   let defEndPos := decRanges >>= fun (decR : DeclarationRanges) => decR.selectionRange.endPos
 
   let modName :=
-  if let some modIdx := env.const2ModIdx.get? fullName then
+  if let some modIdx := env.const2ModIdx.1.find? fullName then
     env.header.moduleNames[modIdx.toNat]!
   else
     env.header.mainModule
