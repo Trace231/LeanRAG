@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 from contextlib import contextmanager
 from multiprocessing import Process
 from pathlib import Path
@@ -289,9 +290,26 @@ def _trace(repo: LeanGitRepo, build_deps: bool) -> None:
             cmd = f"lake env lean --threads {NUM_PROCS} --run ExtractData.lean"
             if not build_deps:
                 cmd += " noDeps"
-            output, error = execute(
-                _with_toolchain(cmd, repo_toolchain), capture_output=True
-            )  # type: ignore[misc]
+            full_cmd = _with_toolchain(cmd, repo_toolchain)
+            # Do not fail immediately on non-zero exit: ExtractData can fail on a subset
+            # of files, and we can recover many of them via sequential repair.
+            res = subprocess.run(full_cmd, shell=True, capture_output=True, check=False)
+            output = (
+                res.stdout.decode(errors="ignore")
+                if isinstance(res.stdout, bytes)
+                else str(res.stdout or "")
+            )
+            error = (
+                res.stderr.decode(errors="ignore")
+                if isinstance(res.stderr, bytes)
+                else str(res.stderr or "")
+            )
+            if res.returncode != 0:
+                logger.warning(
+                    "ExtractData returned non-zero exit code {}. "
+                    "Proceeding with failed-file recovery.",
+                    res.returncode,
+                )
         failed_paths = _extract_failed_paths(output, error)
         still_failed = _repair_failed_files_sequentially(failed_paths, repo_toolchain)
         if still_failed:
