@@ -473,9 +473,24 @@ def shouldProcess (path : FilePath) (noDeps : Bool) : IO Bool := do
   if noDeps ∧ Path.isRelativeTo relativePath Path.packagesDir then
     return false
 
-  let some oleanPath := Path.toBuildDir "lib/lean" relativePath "olean" |
+  -- Lean/Lake layouts vary across versions:
+  --   - output dir may be `lib/lean` or `lib`
+  --   - artifact extension may be `.olean` or `.ilean`
+  -- Accept any known compiled-artifact location to avoid skipping all files.
+  let mut candidates : Array FilePath := #[]
+  for subDir in [("lib/lean" : FilePath), ("lib" : FilePath)] do
+    for ext in ["olean", "ilean"] do
+      match Path.toBuildDir subDir relativePath ext with
+      | some p => candidates := candidates.push p
+      | none => pure ()
+
+  if candidates.isEmpty then
     throw $ IO.userError s!"Invalid path: {path}"
-  return ← oleanPath.pathExists
+
+  for p in candidates do
+    if ← p.pathExists then
+      return true
+  return false
 
 
 /--
