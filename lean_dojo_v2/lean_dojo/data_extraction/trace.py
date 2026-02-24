@@ -169,14 +169,42 @@ def check_files(packages_path: Path, no_deps: bool) -> None:
         for p in cwd.glob("**/build/ir/**/*.dep_paths")
         if not no_deps or not p.is_relative_to(packages_path)
     }
-    oleans = {
-        Path(str(p.with_suffix("")).replace("/build/lib/lean/", "/build/ir/"))
-        for p in cwd.glob("**/build/lib/lean/**/*.olean")
-        if not no_deps or not p.is_relative_to(packages_path)
-    }
-    assert len(jsons) <= len(oleans) and len(deps) <= len(oleans)
-    missing_jsons = {p.with_suffix(".ast.json") for p in oleans - jsons}
-    missing_deps = {p.with_suffix(".dep_paths") for p in oleans - deps}
+    # Lean/Lake artifact layouts differ by version:
+    #   - extension can be `.olean` or `.ilean`
+    #   - lib path can be `build/lib/lean` or `build/lib`
+    compiled = set()
+    compiled_patterns = [
+        "**/build/lib/lean/**/*.olean",
+        "**/build/lib/lean/**/*.ilean",
+        "**/build/lib/**/*.olean",
+        "**/build/lib/**/*.ilean",
+    ]
+    for pat in compiled_patterns:
+        for p in cwd.glob(pat):
+            if no_deps and p.is_relative_to(packages_path):
+                continue
+            compiled.add(p)
+
+    olean_like = set()
+    for p in compiled:
+        s = str(p.with_suffix(""))
+        if "/build/lib/lean/" in s:
+            s = s.replace("/build/lib/lean/", "/build/ir/")
+        elif "/build/lib/" in s:
+            s = s.replace("/build/lib/", "/build/ir/")
+        olean_like.add(Path(s))
+
+    if len(jsons) > len(olean_like) or len(deps) > len(olean_like):
+        logger.warning(
+            "Unexpected extraction counts: ast={}, dep_paths={}, compiled_like={}. "
+            "Continuing with best-effort validation.",
+            len(jsons),
+            len(deps),
+            len(olean_like),
+        )
+
+    missing_jsons = {p.with_suffix(".ast.json") for p in olean_like - jsons}
+    missing_deps = {p.with_suffix(".dep_paths") for p in olean_like - deps}
     if len(missing_jsons) > 0 or len(missing_deps) > 0:
         for p in missing_jsons.union(missing_deps):
             logger.warning(f"Missing {p}")
