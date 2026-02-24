@@ -8,7 +8,7 @@ import random
 import re
 from pathlib import Path
 from statistics import mean
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from loguru import logger
@@ -451,6 +451,74 @@ def _load_dataset_rows(dataset_path: str) -> List[Dict[str, Any]]:
     )
 
 
+def _normalize_lean_path(path: str) -> str:
+    """Normalize Lean file path for robust cross-source matching."""
+    p = str(path or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
+    return p
+
+
+def _path_candidates(path: str) -> Set[str]:
+    base = _normalize_lean_path(path)
+    if not base:
+        return set()
+    cands = {base}
+    if base.endswith(".lean"):
+        cands.add(base[:-5])
+    else:
+        cands.add(base + ".lean")
+    return cands
+
+
+def _path_compatible(a: str, b: str) -> bool:
+    a_cands = _path_candidates(a)
+    b_cands = _path_candidates(b)
+    if not a_cands or not b_cands:
+        return False
+    if a_cands & b_cands:
+        return True
+    for aa in a_cands:
+        for bb in b_cands:
+            if aa.endswith(bb) or bb.endswith(aa):
+                return True
+    return False
+
+
+def _resolve_theorem_from_repo_record(
+    repo_record: Any, full_name: str, file_path: str
+) -> Optional[Theorem]:
+    """Resolve theorem with robust file-path matching across dataset/db formats."""
+    if repo_record is None:
+        return None
+
+    # Fast path first: exact DB lookup.
+    matched = repo_record.get_theorem(full_name, file_path)
+    if matched is not None:
+        return matched
+
+    # Retry DB lookup with normalized path variants.
+    for cand in _path_candidates(file_path):
+        matched = repo_record.get_theorem(full_name, cand)
+        if matched is not None:
+            return matched
+        matched = repo_record.get_theorem(full_name, f"./{cand}")
+        if matched is not None:
+            return matched
+
+    # Fallback: scan by theorem name then fuzzy-compare file paths.
+    candidates: List[Theorem] = []
+    for thm in repo_record.get_all_theorems:
+        if thm.full_name != full_name:
+            continue
+        if _path_compatible(str(thm.file_path), file_path):
+            candidates.append(thm)
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
 def _build_theorem_repo_pairs_from_dataset(
     dataset_path: str,
     default_url: Optional[str],
@@ -464,6 +532,7 @@ def _build_theorem_repo_pairs_from_dataset(
     pairs: List[Tuple[Theorem, LeanGitRepo]] = []
     seen_ids: set[Tuple[str, str, str, str, Optional[Tuple[int, int]], Optional[Tuple[int, int]]]] = set()
     unresolved_count = 0
+    unresolved_examples: List[str] = []
 
     repo_record_cache: Dict[Tuple[str, str], Any] = {}
 
@@ -516,15 +585,22 @@ def _build_theorem_repo_pairs_from_dataset(
         if start is None or end is None:
             repo_record = get_repo_record(url, commit)
             if repo_record is not None:
-                matched = repo_record.get_theorem(full_name, file_path)
+                matched = _resolve_theorem_from_repo_record(
+                    repo_record, full_name, file_path
+                )
                 if matched is not None:
                     start = matched.start
                     end = matched.end
+                    file_path = str(matched.file_path)
                     if not row.get("theorem_statement"):
                         row["theorem_statement"] = matched.theorem_statement
 
         if start is None or end is None:
             unresolved_count += 1
+            if len(unresolved_examples) < 10:
+                unresolved_examples.append(
+                    f"{url}@{commit} | {full_name} | {file_path} | missing start/end"
+                )
             continue
 
         dedup_id = (
@@ -568,6 +644,12 @@ def _build_theorem_repo_pairs_from_dataset(
             "Dataset mode skipped {} rows because theorem positions could not be resolved.",
             unresolved_count,
         )
+        if unresolved_examples:
+            logger.warning(
+                "Unresolved row examples (first {}):\n{}",
+                len(unresolved_examples),
+                "\n".join(f"- {x}" for x in unresolved_examples),
+            )
     return pairs
 
 
@@ -619,20 +701,43 @@ def run_variant(
 
 
 def _run_corpus_consistency_precheck(
-    theorem_repo_pairs, corpus_jsonl_path: str
+    theorem_repo_pairs, corpus_jsonl_path: str, sample_size: int = 20
 ) -> None:
-    """Fail fast if theorem file paths cannot be resolved in the retrieval corpus."""
-    sample_theorem, _ = random.choice(theorem_repo_pairs)
-    sample_path = str(sample_theorem.file_path)
+    """Fail fast if theorem file paths cannot be resolved in the retrieval corpus.
+
+    Use deterministic multi-sample checks instead of random single sample,
+    so failures are easier to reproduce and diagnose.
+    """
     corpus = Corpus(corpus_jsonl_path)
-    _ = corpus._get_file(sample_path)
-    if corpus._resolve_path(sample_path) is None:
+    checked_paths: List[str] = []
+    failed_paths: List[str] = []
+    seen_paths: Set[str] = set()
+
+    for theorem, _ in theorem_repo_pairs:
+        p = str(theorem.file_path)
+        if p in seen_paths:
+            continue
+        seen_paths.add(p)
+        checked_paths.append(p)
+        if len(checked_paths) >= max(sample_size, 1):
+            break
+
+    for p in checked_paths:
+        if corpus._resolve_path(p) is None:
+            failed_paths.append(p)
+
+    if failed_paths:
+        examples = ", ".join(failed_paths[:5])
         raise RuntimeError(
-            "Retrieval precheck failed: current corpus.jsonl does not include the target "
-            f"file path '{sample_path}'. Please regenerate corpus data for the current "
-            "repository/commit or fix path mapping."
+            "Retrieval precheck failed: corpus.jsonl cannot resolve "
+            f"{len(failed_paths)}/{len(checked_paths)} sampled theorem file paths. "
+            f"Examples: {examples}. Please regenerate corpus data for the current "
+            "repository/commit(s) or fix path mapping."
         )
-    logger.info("Retrieval precheck passed for theorem file path: {}", sample_path)
+    logger.info(
+        "Retrieval precheck passed for {} sampled theorem file paths.",
+        len(checked_paths),
+    )
 
 
 def _candidate_repo_corpus_path(theorem_repo_pairs) -> Optional[str]:
