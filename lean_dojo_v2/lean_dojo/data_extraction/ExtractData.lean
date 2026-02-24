@@ -414,7 +414,8 @@ Trace a *.lean file.
 unsafe def processFile (path : FilePath) : IO Unit := do
   println! path
   let input ← IO.FS.readFile path
-  enableInitializersExecution
+  -- In some Lean/Lake execution contexts this can panic with "already exists"
+  -- due to duplicate initializer registration. Safe to skip for tracing here.
   let inputCtx := Parser.mkInputContext input path.toString
   let (header, parserState, messages) ← Parser.parseHeader inputCtx
   let (env, messages) ← processHeader header {} messages inputCtx
