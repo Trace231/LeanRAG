@@ -264,12 +264,6 @@ def findLean (mod : Name) : IO FilePath := do
   if let some p := relativeTo path leanLib then
     path := packagesDir / "lean4/src/lean" / p
 
-  let cwd ← IO.currentDir
-  if path.isAbsolute then
-    match relativeTo path cwd with
-    | some relativePath => path := relativePath
-    | none => pure ()
-
   assert! ← path.pathExists
   return path
 
